@@ -28,6 +28,6 @@ The merging steps can be skipped if "Flexible match" is checked at the top of th
 - Open app.html in a browser
 - Delete all the drawings: click on the checkbox at the top of the drawing store to select all the drawings, and then click on Delete.
 - Load the file `examples/pbkfrommono_monofrompbk.json`
-- Complete the proofs of PbkFromMono and MonoFromPullback that provide a pullback characterisation of monomorphisms: a morphism f is mono if and only if the commutative square `id ; f = id ; f` is a pullback.
+- Complete the proofs of PbkFromMono and MonoFromPullback that provide a pullback characterisation of monomorphisms: a morphism f is mono if and only if the commutative square `id ; f = id ; f` is a pullback. You may need to duplicate an existing edge u, using the symbol ⧉ next to the merge symbol: another edge v will be created between endpoints that are provably equal to those of u, and moreover the equality u = v will be added.
 
 
