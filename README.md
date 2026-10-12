@@ -31,3 +31,6 @@ The merging steps can be skipped if "Flexible match" is checked at the top of th
 - Complete the proofs of PbkFromMono and MonoFromPullback that provide a pullback characterisation of monomorphisms: a morphism f is mono if and only if the commutative square `id ; f = id ; f` is a pullback. You may need to duplicate an existing edge u, using the symbol ⧉ next to the merge symbol: another edge v will be created between endpoints that are provably equal to those of u, and moreover the equality u = v will be added.
 
 
+# Technology stack
+
+Typescript + svelte, developped with opencode, mostly with the help of the Big Pickle model.
