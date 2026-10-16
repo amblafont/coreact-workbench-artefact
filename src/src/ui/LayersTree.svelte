@@ -1,0 +1,18 @@
+<script lang="ts">
+    import type { Layer } from '../index.svelte.ts';
+    import { allLayers } from './store.svelte.ts';
+    import { addRootLayer } from './store.svelte.ts';
+    import LayerNode from './LayerNode.svelte';
+
+    let rootLayers: Layer[] = $derived(allLayers().filter(l => l.parentId === null));
+</script>
+
+<div class="layers-tree-container">
+    <div class="panel-header">
+        <h3>Layers Tree</h3>
+        <button class="layer-btn" title="Add new root layer" onclick={() => addRootLayer()}>+ Root Layer</button>
+    </div>
+    {#each rootLayers as rootLayer}
+        <LayerNode layer={rootLayer} />
+    {/each}
+</div>

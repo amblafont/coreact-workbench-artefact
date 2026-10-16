@@ -1,0 +1,132 @@
+<script lang="ts">
+    import {
+        allDrawings,
+        ui,
+        recordedStatementByDrawing,
+        type StoreDrawing
+    } from './store.svelte.ts';
+    import {
+        setActiveDrawing,
+        renameDrawingName,
+        markDrawingAsRule,
+        deleteSelectedDrawings,
+        generateReverseRulesFor,
+        duplicateDrawing,
+        toggleExportSelection,
+        openProofEditor,
+        suggestAdmittedProof
+    } from './store.svelte.ts';
+    import DrawingNode from './DrawingNode.svelte';
+    import rocqIcon from './rocq-icon.svg';
+
+    let { drawing, isChild = false }: { drawing: StoreDrawing; isChild?: boolean } = $props();
+
+    let isActive = $derived(drawing.name === ui.activeDrawingName);
+    let children = $derived(allDrawings().filter(d => d.parentName === drawing.name && d.name !== drawing.name));
+    let recStatus = $derived(recordedStatementByDrawing().get(drawing.name));
+
+    function onRename(entry: StoreDrawing): void {
+        const newName = prompt(`Enter new name for drawing '${entry.name}':`, entry.name);
+        if (!newName || !newName.trim() || newName.trim() === entry.name) return;
+        renameDrawingName(entry.name, newName.trim());
+    }
+
+    function onToggleRule(entry: StoreDrawing): void {
+        markDrawingAsRule(entry.name, !entry.drawing.isRule);
+    }
+
+    function onDelete(entry: StoreDrawing): void {
+        deleteSelectedDrawings([entry.name]);
+    }
+
+    function onDuplicate(entry: StoreDrawing): void {
+        duplicateDrawing(entry.name);
+    }
+
+    function onGenerateReverseRules(entry: StoreDrawing): void {
+        generateReverseRulesFor(entry.name);
+    }
+</script>
+
+<div
+    class:active={isActive}
+    class:proved={drawing.proved}
+    class:first-order={!isChild && drawing.isFirstOrder}
+    class:second-order={!isChild && drawing.isRule && !drawing.isFirstOrder}
+    class:drawing-child-row={isChild}
+    class="drawing-row"
+>
+    <div class="drawing-row-header">
+        <input
+            type="checkbox"
+            class="export-checkbox"
+            title="Include '{drawing.name}' in the next export"
+            checked={ui.exportSelection.has(drawing.name)}
+            onchange={() => toggleExportSelection(drawing.name)}
+        />
+        <span
+            class="drawing-title"
+            title="Drawing: {drawing.name} ({drawing.drawing.getAllLayers().length} layers, {drawing.drawing.getArtefacts().length} artefacts){drawing.isRule ? (drawing.isFirstOrder ? ' [First-Order Rule]' : ' [Rule]') : ''}{drawing.proved ? ' [Proved]' : ''}"
+        >{drawing.name}</span>
+        {#if drawing.drawing.rocqProof}
+            <button
+                class="rocq-copy-btn"
+                title="View and edit the attached proof of rule '{drawing.name}'"
+                aria-label="View and edit the attached proofs of '{drawing.name}'"
+                onclick={() => openProofEditor(drawing.name)}
+            >
+                <img class="rocq-copy-img" src={rocqIcon} alt="" width="14" height="14" aria-hidden="true" />
+            </button>
+        {:else if drawing.isFirstOrder}
+            <button
+                class="rocq-copy-btn rocq-copy-btn-greyed"
+                title="No proof attached to first-order rule '{drawing.name}': generate an admitted lemma"
+                aria-label="Generate admitted lemmas for first-order rule '{drawing.name}'"
+                onclick={() => suggestAdmittedProof(drawing.name)}
+            >
+                <img class="rocq-copy-img" src={rocqIcon} alt="" width="14" height="14" aria-hidden="true" />
+            </button>
+        {/if}
+        {#if isActive}
+            <span class="active-badge" title="Currently active on canvas">Editing</span>
+        {/if}
+        {#if drawing.proved}
+            <span class="proved-badge" title="First-order statement whose child layer has been proved in the root layer">Proved</span>
+        {/if}
+        {#if recStatus}
+            {#if recStatus.isMain}
+                <span class="rec-badge rec-main" title="Main statement being recorded">Recording</span>
+            {:else if recStatus.proved}
+                <span class="rec-badge rec-proved" title="Subgoal proved in the current recording">Proved in recording</span>
+            {:else}
+                <span class="rec-badge rec-pending" title="Subgoal that still needs a proof in the current recording">Pending proof</span>
+            {/if}
+        {/if}
+        {#if drawing.isRule}
+            {#if drawing.isFirstOrder}
+                <span class="first-order-badge" title="First-order rule: root layer has only one child">1<sup>st</sup>-Order</span>
+            {:else if !isChild}
+                <span class="second-order-badge" title="Second-order rule: root layer has several child layers">2<sup>nd</sup>-Order</span>
+            {/if}
+        {/if}
+    </div>
+    <div class="drawing-row-actions">
+        <button class="layer-btn" title="Open drawing '{drawing.name}' to edit further" onclick={() => setActiveDrawing(drawing.name)}>Open</button>
+        <button class="layer-btn" title="Rename drawing '{drawing.name}'" aria-label="Rename drawing '{drawing.name}'" onclick={() => onRename(drawing)}>✎</button>
+        {#if drawing.isRule && !drawing.isFirstOrder && !isChild}
+            <button class="layer-btn gen-reverse-btn" title="Generate a first-order reverse rule for each premise layer of this second-order rule" onclick={() => onGenerateReverseRules(drawing)}>Gen Reverse</button>
+        {/if}
+        <button class="layer-btn" title={drawing.isRule ? 'Remove the explicit rule marking from this drawing' : 'Explicitly mark this drawing as a rule (must satisfy rule conditions)'} onclick={() => onToggleRule(drawing)}>
+            {drawing.isRule ? 'Unmark Rule' : 'Mark Rule'}
+        </button>
+        <button class="layer-btn dup-btn" title="Duplicate drawing '{drawing.name}'" onclick={() => onDuplicate(drawing)}>⧉</button>
+        <button class="layer-btn row-delete-btn" title="Delete drawing '{drawing.name}'" onclick={() => onDelete(drawing)}>×</button>
+    </div>
+    {#if children.length > 0}
+        <div class="drawing-children">
+            {#each children as child (child.name)}
+                <DrawingNode drawing={child} isChild />
+            {/each}
+        </div>
+    {/if}
+</div>

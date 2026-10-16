@@ -1,0 +1,1602 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { SvelteSet } from 'svelte/reactivity';
+import { getDrawing, drawingStore, ui, sortStore, rocqRecorder, syncProvedStatus, getSelectedDrawingNames, deleteSelectedDrawings, renameDrawingName, pushToast, dismissToast, applyRuleAt,
+    resetInteractionState, togglePositionPicker, isPositionPickerActive, isDraftPickerActive,
+    applyPickedPosition, startPositionPicker, selectArtefactToInspect, removeArtefactNode,
+    toggleEqualityExtend, equalityChildren, onArtefactNodeClick, createDraftArtefact,
+    splitFirstOrderRecording, openProofEditor, closeProofEditor, updateDrawingProof, removeDrawingProofs, suggestAdmittedProof, toggleProofRecording /* runRecorderStep */,
+    closeCodeExport,
+    setActiveDrawing, pendingProofCount, toggleAutoApplyEqualityRules, computeRuleApplications,
+    startMergeMode, selectMergeArtefact, performMerge, unmarkInvalidRules
+} from './store.svelte.ts';
+import { Artefact, Drawing, DrawingStore, getFirstOrderStatementChildLayer } from '../index.svelte.ts';
+import { registerDefaultSorts } from '../demo/buildDemo';
+import { buildComposableEdgesRule, buildChildEqRule, buildEdgeEndpointEqualityRule, buildEqualityOnlyRule, buildFlexibleEqualityRule, buildIsMonoInChildLayerRule, buildNonInjectiveEqualityRule, makeDrawing, makeEdge, makeVertex } from '../demo/helpers';
+
+describe('export selection bookkeeping', () => {
+    beforeEach(() => {
+        getDrawing().clear(false);
+        drawingStore.clear();
+        drawingStore.addDrawing('Initial Drawing', new Drawing(sortStore));
+        drawingStore.addDrawing('Rule Drawing Demo', new Drawing(sortStore));
+        ui.exportSelection = new SvelteSet(['Initial Drawing', 'Rule Drawing Demo']);
+        vi.stubGlobal('confirm', () => true);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        ui.exportSelection = new SvelteSet();
+    });
+
+    it('removes deleted drawing names from the export selection', () => {
+        deleteSelectedDrawings(['Initial Drawing']);
+        expect(ui.exportSelection).toEqual(new Set(['Rule Drawing Demo']));
+        const names = getSelectedDrawingNames();
+        expect(names).toEqual(['Rule Drawing Demo']);
+        expect(() => drawingStore.exportDrawingsJSON(names)).not.toThrow();
+    });
+
+    it('migrates the export selection across a rename', () => {
+        renameDrawingName('Initial Drawing', 'Renamed Drawing');
+        expect(ui.exportSelection).toEqual(new Set(['Renamed Drawing', 'Rule Drawing Demo']));
+        expect(getSelectedDrawingNames()).toEqual(expect.arrayContaining(['Renamed Drawing', 'Rule Drawing Demo']));
+    });
+
+    it('filters stale names out of the export selection', () => {
+        ui.exportSelection = new SvelteSet(['Initial Drawing', 'Ghost Drawing']);
+        expect(getSelectedDrawingNames()).toEqual(['Initial Drawing']);
+    });
+});
+
+describe('toasts', () => {
+    beforeEach(() => {
+        vi.useFakeTimers();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+        ui.toasts = [];
+    });
+
+    it('pushes a toast with unique ids', () => {
+        pushToast('error', 'boom');
+        expect(ui.toasts).toHaveLength(1);
+        expect(ui.toasts[0].kind).toBe('error');
+        expect(ui.toasts[0].message).toBe('boom');
+        pushToast('error', 'again');
+        expect(ui.toasts).toHaveLength(2);
+        expect(ui.toasts[0].id).not.toBe(ui.toasts[1].id);
+    });
+
+    it('dismisses a toast by id', () => {
+        pushToast('info', 'hi');
+        const id = ui.toasts[0].id;
+        dismissToast(id);
+        expect(ui.toasts).toEqual([]);
+    });
+
+    it('auto-dismisses after the kind-specific delay', () => {
+        pushToast('info', 'hi');
+        vi.advanceTimersByTime(3999);
+        expect(ui.toasts).toHaveLength(1);
+        vi.advanceTimersByTime(1);
+        expect(ui.toasts).toEqual([]);
+    });
+});
+
+describe('first-order statement proved status', () => {
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+        vi.stubGlobal('confirm', () => true);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        ui.activeDrawingName = null;
+    });
+
+    function buildStatement(provable: boolean): void {
+        const a = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'a' }, 'root');
+        const b = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'b' }, 'root');
+        if (provable) {
+            getDrawing().newArtefact('Edge', { source: a, target: b }, { width: 2, bend: 0, label: 'g' }, 'root');
+        }
+        getDrawing().addLayer('goal', 'Goal', 'root');
+        getDrawing().newArtefact('Edge', { source: a, target: b }, { width: 2, bend: 0, label: 'c' }, 'goal');
+    }
+
+    it('marks a provable first-order statement as proved', () => {
+        buildStatement(true);
+        drawingStore.addDrawing('Statement', getDrawing());
+        ui.activeDrawingName = 'Statement';
+        syncProvedStatus();
+        expect(drawingStore.getDrawing('Statement')?.proved).toBe(true);
+    });
+
+    it('clears a previously set proved flag when the statement is no longer provable', () => {
+        buildStatement(false);
+        drawingStore.addDrawing('Statement', getDrawing());
+        drawingStore.setDrawingProved('Statement', true);
+        ui.activeDrawingName = 'Statement';
+        syncProvedStatus();
+        expect(drawingStore.getDrawing('Statement')?.proved).toBe(false);
+    });
+
+    it('handles an unsaved active drawing without crashing', () => {
+        buildStatement(true);
+        syncProvedStatus();
+        expect(true).toBe(true);
+    });
+
+    it('records an exact proof to the rocq recorder when proved', () => {
+        buildStatement(true);
+        drawingStore.addDrawing('Statement', getDrawing());
+        ui.activeDrawingName = 'Statement';
+        rocqRecorder.start(getDrawing(), 'Statement', sortStore);
+        syncProvedStatus();
+        const script = rocqRecorder.stop();
+        expect(script).toContain('exact ');
+    });
+});
+
+describe('active drawing after rule application', () => {
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+    });
+
+    afterEach(() => {
+        ui.activeDrawingName = null;
+    });
+
+    it('mutates the stored active drawing when a rule is applied', () => {
+        const { rule } = buildComposableEdgesRule();
+        drawingStore.addDrawing('CompRule', rule);
+
+        const v0 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v0' }, 'root');
+        const v1 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v1' }, 'root');
+        const v2 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v2' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v0, target: v1 }, { width: 2, bend: 0, label: 'e1' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v1, target: v2 }, { width: 2, bend: 0, label: 'e2' }, 'root');
+
+        drawingStore.addDrawing('HostDrawing', getDrawing());
+        ui.activeDrawingName = 'HostDrawing';
+        expect(drawingStore.getDrawing('HostDrawing')?.drawing.getArtefacts().length).toBe(5);
+
+        applyRuleAt('CompRule', 0);
+
+        expect(getDrawing().getArtefacts().length).toBe(6);
+        const saved = drawingStore.getDrawing('HostDrawing');
+        expect(saved).toBeDefined();
+        expect(saved?.drawing.getArtefacts().length).toBe(6);
+    });
+
+    it('preserves parentName of the active drawing across a rule application', () => {
+        const { rule } = buildComposableEdgesRule();
+        drawingStore.addDrawing('CompRule', rule);
+
+        const v0 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v0' }, 'root');
+        const v1 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v1' }, 'root');
+        const v2 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v2' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v0, target: v1 }, { width: 2, bend: 0, label: 'e1' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v1, target: v2 }, { width: 2, bend: 0, label: 'e2' }, 'root');
+
+        drawingStore.addDrawing('ChildDrawing', getDrawing());
+        drawingStore.setDrawingParent('ChildDrawing', 'ParentDrawing');
+        ui.activeDrawingName = 'ChildDrawing';
+
+        expect(drawingStore.getDrawing('ChildDrawing')?.parentName).toBe('ParentDrawing');
+
+        applyRuleAt('CompRule', 0);
+
+        const saved = drawingStore.getDrawing('ChildDrawing');
+        expect(saved?.parentName).toBe('ParentDrawing');
+        expect(saved?.drawing.getArtefacts().length).toBe(6);
+    });
+
+    it('mutates the unsaved canvas when no active drawing is set', () => {
+        const { rule } = buildComposableEdgesRule();
+        drawingStore.addDrawing('CompRule', rule);
+
+        const v0 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v0' }, 'root');
+        const v1 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v1' }, 'root');
+        const v2 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v2' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v0, target: v1 }, { width: 2, bend: 0, label: 'e1' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v1, target: v2 }, { width: 2, bend: 0, label: 'e2' }, 'root');
+
+        ui.activeDrawingName = null;
+
+        expect(() => applyRuleAt('CompRule', 0)).not.toThrow();
+        expect(getDrawing().getArtefacts().length).toBe(6);
+        expect(drawingStore.getAllDrawings().map(d => d.name)).toEqual(['CompRule']);
+    });
+});
+
+describe('goal solved toast on rule application', () => {
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+        ui.toasts = [];
+    });
+
+    afterEach(() => {
+        ui.activeDrawingName = null;
+        ui.toasts = [];
+    });
+
+    it('pushes a success toast when the applied rule solves the goal', () => {
+        const rule = makeDrawing();
+        const rv0 = makeVertex(rule, 'rv0');
+        const rv1 = makeVertex(rule, 'rv1');
+        makeEdge(rule, 're1', rv0, rv1);
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'rg', rv1, rv0, 'conclusion');
+        rule.setIsRule(true);
+        drawingStore.addDrawing('RevRule', rule);
+
+        getDrawing().addLayer('goal', 'Goal', 'root');
+        const hv0 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'hv0' }, 'root');
+        const hv1 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'hv1' }, 'root');
+        getDrawing().newArtefact('Edge', { source: hv0, target: hv1 }, { width: 2, bend: 0, label: 'he1' }, 'root');
+        getDrawing().newArtefact('Edge', { source: hv1, target: hv0 }, { width: 2, bend: 0, label: 'hg' }, 'goal');
+
+        drawingStore.addDrawing('Statement', getDrawing());
+        ui.activeDrawingName = 'Statement';
+        expect(getDrawing().checkLayerProvable('goal').provable).toBe(false);
+
+        applyRuleAt('RevRule', 0);
+
+        expect(ui.toasts.filter(t => t.kind === 'success').map(t => t.message)).toContain('Goal solved');
+    });
+
+    it('does not push a success toast when the goal was already proved', () => {
+        const { rule } = buildComposableEdgesRule();
+        drawingStore.addDrawing('CompRule', rule);
+
+        getDrawing().addLayer('goal', 'Goal', 'root');
+        const hv0 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'hv0' }, 'root');
+        const hv1 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'hv1' }, 'root');
+        const hv2 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'hv2' }, 'root');
+        getDrawing().newArtefact('Edge', { source: hv0, target: hv1 }, { width: 2, bend: 0, label: 'he1' }, 'root');
+        getDrawing().newArtefact('Edge', { source: hv1, target: hv2 }, { width: 2, bend: 0, label: 'he2' }, 'root');
+        getDrawing().newArtefact('Edge', { source: hv0, target: hv2 }, { width: 2, bend: 0, label: 'he3' }, 'root');
+        getDrawing().newArtefact('Edge', { source: hv0, target: hv2 }, { width: 2, bend: 0, label: 'hg' }, 'goal');
+
+        drawingStore.addDrawing('Statement', getDrawing());
+        ui.activeDrawingName = 'Statement';
+        expect(getDrawing().checkLayerProvable('goal').provable).toBe(true);
+
+        applyRuleAt('CompRule', 0);
+
+        expect(ui.toasts.some(t => t.kind === 'success')).toBe(false);
+    });
+
+    it('does not push a success toast when the drawing has no goal', () => {
+        const { rule } = buildComposableEdgesRule();
+        drawingStore.addDrawing('CompRule', rule);
+
+        const v0 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v0' }, 'root');
+        const v1 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v1' }, 'root');
+        const v2 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v2' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v0, target: v1 }, { width: 2, bend: 0, label: 'he1' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v1, target: v2 }, { width: 2, bend: 0, label: 'he2' }, 'root');
+
+        drawingStore.addDrawing('Statement', getDrawing());
+        ui.activeDrawingName = 'Statement';
+
+        applyRuleAt('CompRule', 0);
+
+        expect(ui.toasts.some(t => t.kind === 'success')).toBe(false);
+    });
+
+    it('clears ruleHoverArtefacts when applying a rule', () => {
+        const { rule } = buildComposableEdgesRule();
+        drawingStore.addDrawing('CompRule', rule);
+
+        const v0 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v0' }, 'root');
+        const v1 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v1' }, 'root');
+        const v2 = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v2' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v0, target: v1 }, { width: 2, bend: 0, label: 'he1' }, 'root');
+        getDrawing().newArtefact('Edge', { source: v1, target: v2 }, { width: 2, bend: 0, label: 'he2' }, 'root');
+
+        drawingStore.addDrawing('Statement', getDrawing());
+        ui.activeDrawingName = 'Statement';
+
+        ui.ruleHoverArtefacts = new Set([v0, v1]);
+        applyRuleAt('CompRule', 0);
+
+        expect(ui.ruleHoverArtefacts).toBeNull();
+    });
+});
+
+describe('position picker', () => {
+    const noop = (_data: any, _context: any): any => null;
+
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        if (!sortStore.getSort('Anchor')) sortStore.newSort('Anchor', {}, { position: 'position' }, noop);
+        if (!sortStore.getSort('Rel')) sortStore.newSort('Rel', { anchor: 'Anchor' }, { position: { type: 'relativePosition', target: 'anchor.position' } }, noop);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+        resetInteractionState();
+        vi.stubGlobal('confirm', () => true);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        resetInteractionState();
+    });
+
+    it('bails out when the picked artefact has been removed (bypassing the prune sweep)', () => {
+        const a = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'a' }, 'root');
+        togglePositionPicker(a, 'position');
+        expect(isPositionPickerActive(a, 'position')).toBe(true);
+
+        getDrawing().removeArtefact(a);
+        expect(getDrawing().getArtefactById(a.id)).toBeUndefined();
+        expect(() => applyPickedPosition(5, 5)).not.toThrow();
+        expect(ui.positionPicker).toBeNull();
+        expect(a.data.position).toEqual([0, 0]);
+    });
+
+    it('writes a draft relativePosition offset relative to its dependency', () => {
+        const anchor = getDrawing().newArtefact('Anchor', {}, { position: [100, 100] }, 'root');
+        ui.draftArtefact = { sortName: 'Rel', dependencies: { anchor }, data: { position: [0, 0] }, layerId: 'root' };
+        startPositionPicker({ kind: 'draft', attrName: 'position' });
+
+        applyPickedPosition(110, 120);
+
+        expect(ui.draftArtefact!.data.position).toEqual([10, 20]);
+        expect(ui.positionPicker).toBeNull();
+    });
+
+    it('writes an absolute position onto a real artefact and clears the picker', () => {
+        const a = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'a' }, 'root');
+        togglePositionPicker(a, 'position');
+        expect(isPositionPickerActive(a, 'position')).toBe(true);
+
+        applyPickedPosition(400, 500);
+
+        expect(a.data.position).toEqual([400, 500]);
+        expect(ui.positionPicker).toBeNull();
+    });
+
+    it('does not treat a draft picker as active on a real artefact sharing its data object', () => {
+        const a = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'a' }, 'root');
+        ui.draftArtefact = { sortName: 'Vertex', dependencies: {}, data: a.data, layerId: 'root' };
+        startPositionPicker({ kind: 'draft', attrName: 'position' });
+
+        expect(isDraftPickerActive('position')).toBe(true);
+        expect(isPositionPickerActive(a, 'position')).toBe(false);
+    });
+
+    it('clears inspection and the picker when the picked artefact is removed as a transitive dependent', () => {
+        const v = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'v' }, 'root');
+        const e = getDrawing().newArtefact('Edge', { source: v, target: v }, { width: 2, bend: 0, label: 'e' }, 'root');
+        selectArtefactToInspect(e);
+        togglePositionPicker(e, 'bend');
+        expect(ui.inspectedArtefact).toBe(e);
+
+        removeArtefactNode(v);
+
+        expect(getDrawing().getArtefactById(e.id)).toBeUndefined();
+        expect(ui.inspectedArtefact).toBeNull();
+        expect(ui.positionPicker).toBeNull();
+    });
+
+    it('clears inspection and the picker when the picked artefact is removed directly', () => {
+        const a = getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'a' }, 'root');
+        selectArtefactToInspect(a);
+        togglePositionPicker(a, 'position');
+        expect(ui.inspectedArtefact).toBe(a);
+
+        removeArtefactNode(a);
+
+        expect(ui.inspectedArtefact).toBeNull();
+        expect(ui.positionPicker).toBeNull();
+    });
+});
+
+describe('equality extend picking', () => {
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+        resetInteractionState();
+        vi.stubGlobal('confirm', () => true);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        resetInteractionState();
+    });
+
+    function makeVertices(...labels: string[]): ReturnType<Drawing['newArtefact']>[] {
+        return labels.map(label => getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label }, 'root'));
+    }
+
+    it('adds a picked artefact as an additional equalized child', () => {
+        const [v0, v1, v2] = makeVertices('v0', 'v1', 'v2');
+        const eq = getDrawing().newEqualityArtefact([v0, v1], 'root');
+
+        toggleEqualityExtend(eq);
+        expect(ui.equalityExtendTarget).toBe(eq);
+
+        onArtefactNodeClick(v2);
+
+        expect(equalityChildren(eq).map(c => c.data.label)).toEqual(['v0', 'v1', 'v2']);
+        expect(ui.equalityExtendTarget).toBe(eq);
+    });
+
+    it('dedupes a child already in the equality', () => {
+        const [v0, v1, v2] = makeVertices('v0', 'v1', 'v2');
+        const eq = getDrawing().newEqualityArtefact([v0, v1, v2], 'root');
+
+        toggleEqualityExtend(eq);
+        onArtefactNodeClick(v2);
+
+        expect(equalityChildren(eq)).toHaveLength(3);
+        expect(ui.equalityExtendTarget).toBe(eq);
+    });
+
+    it('rejects an artefact of a different sort with an error toast', () => {
+        const [v0, v1] = makeVertices('v0', 'v1');
+        const e = getDrawing().newArtefact('Edge', { source: v0, target: v1 }, { width: 2, bend: 0, label: 'e' }, 'root');
+        const eq = getDrawing().newEqualityArtefact([v0, v1], 'root');
+
+        toggleEqualityExtend(eq);
+        onArtefactNodeClick(e);
+
+        expect(ui.toasts.some(t => t.kind === 'error')).toBe(true);
+        expect(equalityChildren(eq)).toHaveLength(2);
+        expect(ui.equalityExtendTarget).toBe(eq);
+    });
+
+    it('merges overlapping equalities on the same layer and keeps the extend target', () => {
+        const [v0, v1, v3] = makeVertices('v0', 'v1', 'v3');
+        const eqA = getDrawing().newEqualityArtefact([v0, v1], 'root');
+        getDrawing().newEqualityArtefact([v3, v1], 'root');
+
+        toggleEqualityExtend(eqA);
+        onArtefactNodeClick(v3);
+
+        expect(equalityChildren(eqA).map(c => c.data.label).sort()).toEqual(['v0', 'v1', 'v3']);
+        expect(getDrawing().getArtefacts().filter(a => a.sortName === 'Equality')).toHaveLength(1);
+        expect(ui.equalityExtendTarget).toBe(eqA);
+    });
+
+    it('switches the extend target when another equality row is clicked', () => {
+        const [v0, v1, v2, v3] = makeVertices('v0', 'v1', 'v2', 'v3');
+        const eqA = getDrawing().newEqualityArtefact([v0, v1], 'root');
+        const eqB = getDrawing().newEqualityArtefact([v2, v3], 'root');
+
+        toggleEqualityExtend(eqA);
+        onArtefactNodeClick(eqB);
+
+        expect(ui.equalityExtendTarget).toBe(eqB);
+
+        toggleEqualityExtend(eqB);
+        expect(ui.equalityExtendTarget).toBeNull();
+    });
+
+    it('falls back to inspection once extend picking is off', () => {
+        const [v0, v1] = makeVertices('v0', 'v1');
+        const eq = getDrawing().newEqualityArtefact([v0, v1], 'root');
+        const other = makeVertices('other')[0];
+
+        toggleEqualityExtend(eq);
+        toggleEqualityExtend(eq);
+        expect(ui.equalityExtendTarget).toBeNull();
+
+        onArtefactNodeClick(other);
+        expect(ui.inspectedArtefact).toBe(other);
+    });
+
+    it('clears the extend target when the equality is removed', () => {
+        const [v0, v1] = makeVertices('v0', 'v1');
+        const eq = getDrawing().newEqualityArtefact([v0, v1], 'root');
+
+        toggleEqualityExtend(eq);
+        removeArtefactNode(eq);
+
+        expect(ui.equalityExtendTarget).toBeNull();
+    });
+
+    it('resetInteractionState clears the extend target', () => {
+        const [v0, v1] = makeVertices('v0', 'v1');
+        const eq = getDrawing().newEqualityArtefact([v0, v1], 'root');
+
+        toggleEqualityExtend(eq);
+        expect(ui.equalityExtendTarget).toBe(eq);
+
+        resetInteractionState();
+        expect(ui.equalityExtendTarget).toBeNull();
+    });
+
+    it('resetInteractionState clears rule and menu hover state', () => {
+        const [v0] = makeVertices('v0');
+        ui.ruleHoverArtefacts = new Set([v0]);
+        ui.menuHoverArtefact = v0;
+
+        resetInteractionState();
+
+        expect(ui.ruleHoverArtefacts).toBeNull();
+        expect(ui.menuHoverArtefact).toBeNull();
+    });
+
+    it('keeps an equality draft open to pick more than two children until validated', () => {
+        const [v0, v1, v2] = makeVertices('v0', 'v1', 'v2');
+        ui.draftArtefact = { sortName: 'Equality', dependencies: {}, data: {}, layerId: 'root' };
+        ui.dependencyPickingFor = 'Equality';
+
+        onArtefactNodeClick(v0);
+        onArtefactNodeClick(v1);
+
+        expect(ui.draftArtefact).not.toBeNull();
+        expect(equalityChildren(ui.draftArtefact!)).toHaveLength(2);
+        expect(getDrawing().getArtefacts()).toHaveLength(3);
+
+        onArtefactNodeClick(v2);
+
+        expect(ui.draftArtefact).not.toBeNull();
+        expect(equalityChildren(ui.draftArtefact!)).toHaveLength(3);
+
+        const created = createDraftArtefact();
+
+        expect(created?.sortName).toBe('Equality');
+        expect(equalityChildren(created!)).toHaveLength(3);
+        expect(ui.draftArtefact).toBeNull();
+        expect(ui.dependencyPickingFor).toBeNull();
+    });
+});
+
+describe('rocq recording proof attachment', () => {
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+        ui.exportSelection = new SvelteSet();
+        closeCodeExport();
+        vi.stubGlobal('confirm', () => true);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        ui.activeDrawingName = null;
+        ui.exportTarget = 'rocq';
+        ui.exportSelection = new SvelteSet();
+        closeCodeExport();
+        if (rocqRecorder.isActive()) {
+            rocqRecorder.stop();
+        }
+    });
+
+    function buildStatement(): Drawing {
+        const stmt = getDrawing();
+        const a = makeVertex(stmt, 'a');
+        const b = makeVertex(stmt, 'b');
+        makeEdge(stmt, 'g', a, b);
+        stmt.addLayer('conc', 'Conclusion', 'root');
+        makeEdge(stmt, 'c', a, b, 'conc');
+        return stmt;
+    }
+
+    it('renames the working drawing to "(proof)" and adds a first-order rule clone carrying the proof', () => {
+        const stmt = buildStatement();
+        drawingStore.addDrawing('Statement', stmt);
+        ui.activeDrawingName = 'Statement';
+        ui.exportSelection = new SvelteSet(['Statement']);
+
+        const snapshot = DrawingStore.cloneDrawing(stmt, sortStore);
+        const script = 'Lemma Statement_rule : Type.\\nintros_sigma ().\\nAbort.\\n';
+        const { proofName } = splitFirstOrderRecording('Statement', snapshot, script);
+
+        expect(proofName).toBe('Statement (proof)');
+        expect(drawingStore.getDrawing('Statement (proof)')?.drawing).toBe(stmt);
+        const rule = drawingStore.getDrawing('Statement');
+        expect(rule?.drawing).toBe(snapshot);
+        expect(rule!.drawing.isRule).toBe(true);
+        expect(rule!.drawing.rocqProof).toBe(script);
+        expect(getFirstOrderStatementChildLayer(rule!.drawing)).not.toBeNull();
+        expect(ui.activeDrawingName).toBe('Statement (proof)');
+        expect(ui.exportSelection.has('Statement (proof)')).toBe(true);
+        expect(ui.exportSelection.has('Statement')).toBe(false);
+    });
+
+    it('auto-uniquifies the proof working name on collision', () => {
+        const stmt = buildStatement();
+        drawingStore.addDrawing('Statement', stmt);
+        const snapshot = DrawingStore.cloneDrawing(stmt, sortStore);
+        drawingStore.addDrawing('Statement (proof)', new Drawing(sortStore));
+
+        const { proofName } = splitFirstOrderRecording('Statement', snapshot, 'Lemma Statement_rule : True.\\nexact I.\\nQed.\\n');
+        expect(proofName).toBe('Statement (proof) (2)');
+        expect(drawingStore.getDrawing('Statement')?.drawing).toBe(snapshot);
+        expect(drawingStore.getDrawing('Statement (proof) (2)')?.drawing).toBe(stmt);
+    });
+
+    it('rejects a snapshot that is not a first-order statement', () => {
+        const nonStatement = new Drawing(sortStore);
+        makeVertex(nonStatement, 'x');
+        makeVertex(nonStatement, 'y');
+        drawingStore.addDrawing('NotStatement', nonStatement);
+
+        const snapshot = DrawingStore.cloneDrawing(nonStatement, sortStore);
+        expect(() => splitFirstOrderRecording('NotStatement', snapshot, 'script')).toThrow(/not a first-order statement/);
+    });
+
+    it('rejects a recording whose drawing is no longer in the store', () => {
+        const stmt = buildStatement();
+        const snapshot = DrawingStore.cloneDrawing(stmt, sortStore);
+        expect(() => splitFirstOrderRecording('Missing', snapshot, 'script')).toThrow(/does not exist/);
+    });
+
+    it('round-trips the attached proof through drawing JSON export and import', () => {
+        const stmt = buildStatement();
+        stmt.setIsRule(true);
+        stmt.setRocqProof('Lemma Statement_rule : True.\\nexact I.\\nQed.\\n');
+        drawingStore.addDrawing('Statement', stmt);
+
+        const json = drawingStore.exportDrawingsJSON(['Statement']);
+        const freshStore = new DrawingStore();
+        freshStore.importDrawingsJSON(json, sortStore);
+
+        const restored = freshStore.getDrawing('Statement');
+        expect(restored?.drawing.rocqProof).toBe('Lemma Statement_rule : True.\\nexact I.\\nQed.\\n');
+        expect(restored?.drawing.isRule).toBe(true);
+    });
+
+    it('openProofEditor and closeProofEditor track the edited drawing in ui', () => {
+        const stmt = buildStatement();
+        drawingStore.addDrawing('Statement', stmt);
+
+        openProofEditor('Statement');
+        expect(ui.proofEditorName).toBe('Statement');
+        closeProofEditor();
+        expect(ui.proofEditorName).toBeNull();
+        expect(ui.proofEditorRocqDraft).toBeNull();
+    });
+
+    it('openProofEditor with a draft prefills the editor without attaching', () => {
+        const stmt = buildStatement();
+        stmt.setRocqProof(null);
+        drawingStore.addDrawing('Statement', stmt);
+
+        openProofEditor('Statement', { rocq: 'draft script' });
+        expect(ui.proofEditorName).toBe('Statement');
+        expect(ui.proofEditorRocqDraft).toBe('draft script');
+        expect(drawingStore.getDrawing('Statement')?.drawing.rocqProof).toBeNull();
+        closeProofEditor();
+    });
+
+    it('updateDrawingProof replaces the attached proof', () => {
+        const stmt = buildStatement();
+        stmt.setRocqProof('old script');
+        drawingStore.addDrawing('Statement', stmt);
+
+        updateDrawingProof('Statement', 'rocq', 'new script');
+        expect(ui.proofEditorName).toBeNull();
+        expect(drawingStore.getDrawing('Statement')?.drawing.rocqProof).toBe('new script');
+    });
+
+    it('updateDrawingProof with an empty script clears the proof', () => {
+        const stmt = buildStatement();
+        stmt.setRocqProof('some script');
+        drawingStore.addDrawing('Statement', stmt);
+
+        updateDrawingProof('Statement', 'rocq', '   \n  ');
+        expect(drawingStore.getDrawing('Statement')?.drawing.rocqProof).toBeNull();
+    });
+
+    it('updateDrawingProof reports a missing drawing', () => {
+        updateDrawingProof('DoesNotExist', 'rocq', 'script');
+        const toast = ui.toasts[ui.toasts.length - 1];
+        expect(toast.kind).toBe('error');
+        expect(String(toast.message)).toContain('does not exist');
+        ui.toasts = [];
+    });
+
+    it('removeDrawingProofs clears the attached proof', () => {
+        const stmt = buildStatement();
+        stmt.setRocqProof('Lemma Statement_rule : True.\\nexact I.\\nQed.');
+        drawingStore.addDrawing('Statement', stmt);
+
+        removeDrawingProofs('Statement');
+        expect(drawingStore.getDrawing('Statement')?.drawing.rocqProof).toBeNull();
+    });
+
+    it('suggestAdmittedProof opens the editor with a generated admitted draft without attaching it', () => {
+        const stmt = buildStatement();
+        stmt.setRocqProof(null);
+        drawingStore.addDrawing('Statement', stmt);
+
+        suggestAdmittedProof('Statement');
+
+        expect(ui.proofEditorName).toBe('Statement');
+        const rocqDraft = ui.proofEditorRocqDraft;
+        expect(rocqDraft).toContain('Lemma Statement_rule :');
+        expect(rocqDraft).toContain('admit.');
+        expect(rocqDraft).toContain('Admitted.');
+        expect(drawingStore.getDrawing('Statement')?.drawing.rocqProof).toBeNull();
+        closeProofEditor();
+    });
+
+    it('suggestAdmittedProof reports a missing drawing', () => {
+        suggestAdmittedProof('DoesNotExist');
+        const toast = ui.toasts[ui.toasts.length - 1];
+        expect(toast.kind).toBe('error');
+        expect(String(toast.message)).toContain('does not exist');
+        ui.toasts = [];
+    });
+
+    it('toggleProofRecording records and opens the proof export window with the Rocq proof', () => {
+        const stmt = buildStatement();
+        drawingStore.addDrawing('Statement', stmt);
+        ui.activeDrawingName = 'Statement';
+
+        toggleProofRecording();
+        expect(rocqRecorder.isActive()).toBe(true);
+        // Solving the main goal with no subgoal pending stops the recording by
+        // itself and opens the export window, so no manual stop is needed.
+        syncProvedStatus();
+        expect(rocqRecorder.isActive()).toBe(false);
+
+        const rule = drawingStore.getDrawing('Statement');
+        expect(rule?.drawing.isRule).toBe(true);
+        expect(rule!.drawing.rocqProof).not.toBeNull();
+        expect(rule!.drawing.rocqProof).toContain('Lemma Statement_rule :');
+        const working = drawingStore.getDrawing('Statement (proof)');
+        expect(working?.drawing).toBe(stmt);
+
+        expect(ui.proofEditorName).toBeNull();
+        expect(ui.codeExport?.names).toEqual(['Statement']);
+        expect(ui.codeExport?.rocq).toContain('Lemma Statement_rule :');
+        expect(ui.exportSelection.has('Statement')).toBe(true);
+        closeCodeExport();
+    });
+
+    it('discards a recording whose drawing stopped being a first-order statement', () => {
+        const stmt = buildStatement();
+        drawingStore.addDrawing('Statement', stmt);
+        ui.activeDrawingName = 'Statement';
+
+        toggleProofRecording();
+        expect(rocqRecorder.isActive()).toBe(true);
+
+        // Break the first-order shape mid-recording by adding a second child of
+        // the root layer.
+        stmt.addLayer('extra', 'Extra', 'root');
+
+        toggleProofRecording();
+
+        expect(rocqRecorder.isActive()).toBe(false);
+        expect(ui.recordingActive).toBe(false);
+        expect(ui.codeExport).toBeNull();
+        expect(ui.exportSelection.size).toBe(0);
+        // Nothing was attached: the drawing keeps its name and is not a rule.
+        expect(drawingStore.getDrawing('Statement')?.drawing).toBe(stmt);
+        expect(stmt.isRule).toBe(false);
+        const toast = ui.toasts[ui.toasts.length - 1];
+        expect(toast.kind).toBe('error');
+        expect(String(toast.message)).toContain('no longer a first-order statement');
+        ui.toasts = [];
+    });
+
+    it('refuses to start proof recording when the drawing is not a first-order statement', () => {
+        buildStatement();
+        getDrawing().addLayer('extra', 'Extra', 'root');
+        drawingStore.addDrawing('NotStatement', getDrawing());
+        ui.activeDrawingName = 'NotStatement';
+
+        toggleProofRecording();
+
+        expect(rocqRecorder.isActive()).toBe(false);
+        expect(ui.recordingActive).toBe(false);
+        const toast = ui.toasts[ui.toasts.length - 1];
+        expect(toast.kind).toBe('error');
+        expect(String(toast.message)).toContain('not a first-order statement');
+        ui.toasts = [];
+    });
+
+});
+
+describe('merge recording', () => {
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+        ui.recordingActive = false;
+        ui.toasts = [];
+        closeProofEditor();
+    });
+
+    afterEach(() => {
+        ui.activeDrawingName = null;
+        ui.recordingActive = false;
+        ui.toasts = [];
+        closeProofEditor();
+        if (rocqRecorder.isActive()) {
+            rocqRecorder.stop();
+        }
+    });
+
+    function startRecording(stmt: Drawing): void {
+        drawingStore.addDrawing('Statement', stmt);
+        ui.activeDrawingName = 'Statement';
+        // These tests exercise the recorder's merge steps, not the Start Proof
+        // gate (which requires a first-order statement), so start directly.
+        rocqRecorder.start(stmt, 'Statement', sortStore);
+        ui.recordingActive = true;
+        expect(rocqRecorder.isActive()).toBe(true);
+    }
+
+    // A statement with two parallel edges `f` and `g`, related by an equality so
+    // that the pair is provably equal and may be merged while recording.
+    function buildLabelledStatement(): { stmt: Drawing; first: Artefact; second: Artefact } {
+        const stmt = getDrawing();
+        const a = makeVertex(stmt, 'a');
+        const b = makeVertex(stmt, 'b');
+        const first = makeEdge(stmt, 'f', a, b);
+        const second = makeEdge(stmt, 'g', a, b);
+        stmt.newEqualityArtefact([first, second], 'root');
+        return { stmt, first, second };
+    }
+
+    it('records the automatic rename of the merged artefact', () => {
+        const { stmt, first, second } = buildLabelledStatement();
+        startRecording(stmt);
+
+        startMergeMode(first);
+        selectMergeArtefact(second);
+        performMerge();
+
+        // The merge keeps the second artefact and labels it "f, g".
+        expect(ui.inspectedArtefact).toBe(second);
+        expect(second.data.label).toBe('f, g');
+
+        const script = rocqRecorder.stop();
+        expect(script).toContain('rename g into f__g.');
+    });
+
+    it('refuses to merge non-provably-equal artefacts on a recorded layer while recording', () => {
+        const stmt = getDrawing();
+        const a = makeVertex(stmt, 'a');
+        const b = makeVertex(stmt, 'b');
+        const first = makeEdge(stmt, 'f', a, b);
+        const second = makeEdge(stmt, 'g', a, b);
+        startRecording(stmt);
+
+        startMergeMode(first);
+        selectMergeArtefact(second);
+
+        // The pair is not provably equal, so the second pick is refused and the
+        // merge would be recorded as a rename without any equality to justify it.
+        expect(ui.mergeSecondArtefact).toBeNull();
+        const toast = ui.toasts[ui.toasts.length - 1];
+        expect(toast.kind).toBe('error');
+        expect(String(toast.message)).toContain('not provably equal');
+
+        performMerge();
+        expect(second.data.label).toBe('g');
+        expect(stmt.getArtefacts()).toContain(first);
+        expect(rocqRecorder.stop()).not.toContain('rename');
+    });
+
+    it('frees the merged artefact name before renaming the survivor into it', () => {
+        // Two unlabelled isMonos: the removed one held "isMono_2" and the
+        // survivor inherits that name from the export registry, so its rename
+        // target is still taken in the proof unless the removed binder moves.
+        const stmt = getDrawing();
+        const a = makeVertex(stmt, 'a');
+        const b = makeVertex(stmt, 'b');
+        const e1 = makeEdge(stmt, 'e1', a, b);
+        const first = stmt.newArtefact('isMono', { arrow: e1 }, {}, 'root');
+        const second = stmt.newArtefact('isMono', { arrow: e1 }, {}, 'root');
+        stmt.newEqualityArtefact([first, second], 'root');
+        startRecording(stmt);
+
+        startMergeMode(first);
+        selectMergeArtefact(second);
+        performMerge();
+
+        const script = rocqRecorder.stop();
+        const aside = script.indexOf('rename isMono_2 into Hmerged.');
+        const survivor = script.indexOf('rename isMono_3 into isMono_2.');
+        expect(aside).toBeGreaterThan(-1);
+        expect(survivor).toBeGreaterThan(aside);
+    });
+
+    it('records the renames of the artefacts the merge renames as a side effect', () => {
+        // Three unlabelled isMonos over one edge: dropping the first shifts the
+        // export names of the other two down, so both have to follow in the
+        // recorded script.
+        const stmt = getDrawing();
+        const a = makeVertex(stmt, 'a');
+        const b = makeVertex(stmt, 'b');
+        const e1 = makeEdge(stmt, 'e1', a, b);
+        const first = stmt.newArtefact('isMono', { arrow: e1 }, {}, 'root');
+        const second = stmt.newArtefact('isMono', { arrow: e1 }, {}, 'root');
+        stmt.newArtefact('isMono', { arrow: e1 }, {}, 'root');
+        stmt.newEqualityArtefact([first, second], 'root');
+        startRecording(stmt);
+
+        startMergeMode(first);
+        selectMergeArtefact(second);
+        performMerge();
+
+        const script = rocqRecorder.stop();
+        expect(script.indexOf('rename isMono_2 into Hmerged.')).toBeGreaterThan(-1);
+        expect(script.indexOf('rename isMono_3 into isMono_2.')).toBeGreaterThan(
+            script.indexOf('rename isMono_2 into Hmerged.'));
+        expect(script.indexOf('rename isMono_4 into isMono_3.')).toBeGreaterThan(
+            script.indexOf('rename isMono_3 into isMono_2.'));
+    });
+
+    it('records nothing when the merge happens outside a recorded layer', () => {
+        const stmt = getDrawing();
+        const a = makeVertex(stmt, 'a');
+        const b = makeVertex(stmt, 'b');
+        const edge = makeEdge(stmt, 'e', a, b);
+        stmt.addLayer('premise', 'Premise', 'root');
+        stmt.addLayer('premise-child', 'Premise Child', 'premise');
+        const first = makeEdge(stmt, 'p1', a, b, 'premise');
+        const second = makeEdge(stmt, 'p2', a, b, 'premise');
+        startRecording(stmt);
+
+        startMergeMode(first);
+        selectMergeArtefact(second);
+        performMerge();
+
+        // A premise layer is inlined as an `assert`, so its artefacts have no
+        // binder to rename and the script stays untouched.
+        const script = rocqRecorder.stop();
+        expect(script).not.toContain('rename');
+        expect(ui.inspectedArtefact).toBe(second);
+        expect(edge.data.label).toBe('e');
+    });
+
+    it('records nothing when no recording is running', () => {
+        const { stmt, first, second } = buildLabelledStatement();
+        drawingStore.addDrawing('Statement', stmt);
+        ui.activeDrawingName = 'Statement';
+        expect(rocqRecorder.isActive()).toBe(false);
+
+        startMergeMode(first);
+        selectMergeArtefact(second);
+        expect(() => performMerge()).not.toThrow();
+
+        expect(ui.inspectedArtefact).toBe(second);
+        expect(second.data.label).toBe('f, g');
+    });
+});
+
+describe('proof recording subgoal navigation', () => {
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+        ui.recordingActive = false;
+        ui.toasts = [];
+        ui.exportSelection = new SvelteSet();
+        closeProofEditor();
+        closeCodeExport();
+        vi.stubGlobal('confirm', () => true);
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        ui.activeDrawingName = null;
+        ui.recordingActive = false;
+        ui.toasts = [];
+        ui.exportSelection = new SvelteSet();
+        closeProofEditor();
+        closeCodeExport();
+        if (rocqRecorder.isActive()) {
+            rocqRecorder.stop();
+        }
+    });
+
+    // A host whose goal is NOT reachable from the rule's conclusion (it asks for
+    // the reverse edge), so the main goal stays open and the subgoals alone drive
+    // the recording.
+    function buildHost(): Drawing {
+        const host = new Drawing(sortStore);
+        const a = makeVertex(host, 'a');
+        const b = makeVertex(host, 'b');
+        makeEdge(host, 'g', a, b);
+        host.addLayer('conc', 'Conclusion', 'root');
+        makeEdge(host, 'reverse', b, a, 'conc');
+        return host;
+    }
+
+    function buildSolvableStatement(name: string): Drawing {
+        const stmt = new Drawing(sortStore);
+        const a = makeVertex(stmt, 'a');
+        const b = makeVertex(stmt, 'b');
+        makeEdge(stmt, 'g', a, b);
+        stmt.addLayer('conc', 'Conclusion', 'root');
+        makeEdge(stmt, 'c', a, b, 'conc');
+        drawingStore.addDrawing(name, stmt);
+        return stmt;
+    }
+
+    // A second-order rule with one premise layer per name. Its conclusion is an
+    // `isMono` the host does not already have, so the application is neither
+    // redundant nor a no-op and survives the store's default filters. Each
+    // premise goal demands an edge its premise layer does not supply, so every
+    // derived subgoal starts unproved; `solvablePremises` instead puts that edge
+    // in the premise layer, making each derived subgoal provable on load.
+    function buildSecondOrderRule(premiseNames: string[], solvablePremises = false): Drawing {
+        const rule = new Drawing(sortStore);
+        const v0 = makeVertex(rule, 'rv0');
+        const v1 = makeVertex(rule, 'rv1');
+        const re = makeEdge(rule, 're', v0, v1);
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.newArtefact('isMono', { arrow: re }, {}, 'conclusion');
+        premiseNames.forEach((name, i) => {
+            const premiseId = `premise-${i}`;
+            rule.addLayer(premiseId, name, 'root');
+            const pv = rule.newArtefact('Vertex', {}, { position: [0, 0], label: `pv${i}` }, premiseId);
+            if (solvablePremises) {
+                makeEdge(rule, `pce${i}`, pv, v0, premiseId);
+            }
+            const childId = `premise-${i}-child`;
+            rule.addLayer(childId, `${name} Child`, premiseId);
+            makeEdge(rule, `pc${i}`, pv, v0, childId);
+        });
+        rule.setIsRule(true);
+        drawingStore.addDrawing('SO', rule);
+        return rule;
+    }
+
+    function byLabel(drawing: Drawing, label: string): Artefact {
+        const art = drawing.getArtefacts().find(a => String(a.data.label) === label);
+        if (!art) {
+            throw new Error(`No artefact labelled '${label}'.`);
+        }
+        return art;
+    }
+
+    function startRecording(): void {
+        toggleProofRecording();
+        expect(rocqRecorder.isActive()).toBe(true);
+    }
+
+    // Apply the rule and return the derived subgoal drawing names in
+    // registration order.
+    function applyRule(): string[] {
+        const before = new Set(drawingStore.getAllNames());
+        applyRuleAt('SO', 0);
+        return drawingStore.getAllNames().filter(n => !before.has(n));
+    }
+
+    function goalLayerOfCurrentDrawing() {
+        return getFirstOrderStatementChildLayer(getDrawing());
+    }
+
+    // Discharge the active subgoal. A derived subgoal is a flat two-layer
+    // drawing: the copied host context and the instantiated premise share the
+    // root layer, and the "Goal" child layer is what has to be proved. When the
+    // goal is not yet reachable, supply the edge it asks for in the root layer.
+    function solveCurrentSubgoal(): void {
+        const goal = goalLayerOfCurrentDrawing();
+        expect(goal).not.toBeNull();
+        if (getDrawing().checkLayerProvable(goal!.id).provable === false) {
+            getDrawing().newArtefact(
+                'Edge',
+                { source: byLabel(getDrawing(), 'pv0'), target: byLabel(getDrawing(), 'a') },
+                { width: 2, bend: 0, label: 'supplied' },
+                'root'
+            );
+            expect(getDrawing().checkLayerProvable(goal!.id).provable).toBe(true);
+        }
+        syncProvedStatus();
+    }
+
+    it('loads the next pending subgoal as soon as a subgoal is solved', () => {
+        drawingStore.addDrawing('Host', buildHost());
+        buildSecondOrderRule(['Premise A', 'Premise B']);
+        setActiveDrawing('Host');
+
+        startRecording();
+        const [subA, subB] = applyRule();
+        expect(subA).toBe('Host > SO > Premise A');
+        expect(subB).toBe('Host > SO > Premise B');
+        expect(ui.activeDrawingName).toBe('Host');
+
+        setActiveDrawing(subA);
+        solveCurrentSubgoal();
+
+        expect(ui.activeDrawingName).toBe(subB);
+        expect(rocqRecorder.isActive()).toBe(true);
+        expect(pendingProofCount()).toBe(1);
+    });
+
+    it('stops the recording and opens the export window when the last subgoal is solved', () => {
+        const host = buildHost();
+        drawingStore.addDrawing('Host', host);
+        buildSecondOrderRule(['Premise A']);
+        setActiveDrawing('Host');
+
+        startRecording();
+        const [subA] = applyRule();
+
+        setActiveDrawing(subA);
+        solveCurrentSubgoal();
+
+        expect(rocqRecorder.isActive()).toBe(false);
+        expect(ui.recordingActive).toBe(false);
+        expect(ui.codeExport?.names).toEqual(['SO', 'Host']);
+        expect(ui.codeExport?.rocq).toContain('Parameter SO_rule :');
+        expect(ui.exportSelection.has('SO')).toBe(true);
+        expect(ui.exportSelection.has('Host')).toBe(true);
+        const rule = drawingStore.getDrawing('Host');
+        expect(rule?.drawing.isRule).toBe(true);
+        // The solved subgoal is inlined as a complete proof (no `admit.`); the
+        // still-open main goal is what leaves the lemma admitted.
+        expect(rule!.drawing.rocqProof).toContain('assert (Hpremise1');
+        expect(rule!.drawing.rocqProof).toContain('exact supplied.');
+        expect(rule!.drawing.rocqProof).toContain('Admitted.');
+        expect(drawingStore.getDrawing('Host (proof)')?.drawing).toBe(host);
+    });
+
+    it('solving the main goal with a pending subgoal loads that subgoal instead of stopping', () => {
+        const host = buildHost();
+        drawingStore.addDrawing('Host', host);
+        buildSecondOrderRule(['Premise A']);
+        setActiveDrawing('Host');
+
+        startRecording();
+        const [subA] = applyRule();
+        expect(rocqRecorder.isActive()).toBe(true);
+
+        // Satisfy the main goal: it asks for the reverse edge, which the rule's
+        // conclusion does not supply.
+        const goal = goalLayerOfCurrentDrawing()!;
+        host.newArtefact('Edge', { source: byLabel(host, 'b'), target: byLabel(host, 'a') }, { width: 2, bend: 0, label: 'back' }, 'root');
+        expect(host.checkLayerProvable(goal.id).provable).toBe(true);
+
+        syncProvedStatus();
+
+        expect(rocqRecorder.isActive()).toBe(true);
+        expect(ui.activeDrawingName).toBe(subA);
+        expect(pendingProofCount()).toBe(1);
+    });
+
+    it('solving the main goal with no subgoal pending stops the recording and opens the export window', () => {
+        const stmt = buildSolvableStatement('Statement');
+        setActiveDrawing('Statement');
+
+        startRecording();
+        const goal = goalLayerOfCurrentDrawing()!;
+        expect(stmt.checkLayerProvable(goal.id).provable).toBe(true);
+
+        syncProvedStatus();
+
+        expect(rocqRecorder.isActive()).toBe(false);
+        expect(ui.recordingActive).toBe(false);
+        expect(ui.codeExport?.names).toEqual(['Statement']);
+        expect(ui.exportSelection.has('Statement')).toBe(true);
+        const rule = drawingStore.getDrawing('Statement');
+        expect(rule?.drawing.isRule).toBe(true);
+        // The main goal is closed too, so the script ends with `Qed.`.
+        expect(rule!.drawing.rocqProof).toContain('Qed.');
+        expect(rule!.drawing.rocqProof).not.toContain('Admitted.');
+    });
+
+    it('a rule application that solves the main goal with no subgoal pending stops the recording', () => {
+        const host = buildHost();
+        drawingStore.addDrawing('Host', host);
+        // A first-order rule whose conclusion is the reverse edge the host goal
+        // asks for: applying it solves the main goal outright.
+        const rule = new Drawing(sortStore);
+        const v0 = makeVertex(rule, 'rv0');
+        const v1 = makeVertex(rule, 'rv1');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'rce', v1, v0, 'conclusion');
+        rule.setIsRule(true);
+        drawingStore.addDrawing('FO', rule);
+        setActiveDrawing('Host');
+
+        startRecording();
+        expect(rocqRecorder.isActive()).toBe(true);
+        applyRuleAt('FO', 0);
+
+        expect(rocqRecorder.isActive()).toBe(false);
+        expect(ui.codeExport?.names).toEqual(['FO', 'Host']);
+        expect(ui.exportSelection.has('FO')).toBe(true);
+    });
+
+    it('re-solving an already solved subgoal does not skip the queue', () => {
+        drawingStore.addDrawing('Host', buildHost());
+        buildSecondOrderRule(['Premise A', 'Premise B']);
+        setActiveDrawing('Host');
+
+        startRecording();
+        const [subA, subB] = applyRule();
+
+        setActiveDrawing(subA);
+        solveCurrentSubgoal();
+        expect(ui.activeDrawingName).toBe(subB);
+
+        setActiveDrawing(subA);
+        syncProvedStatus();
+        expect(ui.activeDrawingName).toBe(subA);
+        expect(rocqRecorder.isActive()).toBe(true);
+        expect(pendingProofCount()).toBe(1);
+    });
+
+    it('chains through a subgoal that is already provable when it is loaded', () => {
+        drawingStore.addDrawing('Host', buildHost());
+        buildSecondOrderRule(['Premise A', 'Premise B'], true);
+        setActiveDrawing('Host');
+
+        startRecording();
+        const [subA, subB] = applyRule();
+        expect(subA).not.toBe(subB);
+
+        // Both derived subgoals are provable as they are loaded, so the walk
+        // must pass through A, discharge it, pass through B and then stop.
+        setActiveDrawing(subA);
+        solveCurrentSubgoal();
+
+        expect(rocqRecorder.isActive()).toBe(false);
+        expect(ui.codeExport?.names).toEqual(['SO', 'Host']);
+    });
+
+    it('proving an unregistered drawing advances nothing while recording is on', () => {
+        drawingStore.addDrawing('Host', buildHost());
+        buildSolvableStatement('Other');
+        buildSecondOrderRule(['Premise A', 'Premise B']);
+        setActiveDrawing('Host');
+
+        startRecording();
+        const [subA] = applyRule();
+
+        setActiveDrawing('Other');
+        syncProvedStatus();
+
+        expect(ui.activeDrawingName).toBe('Other');
+        expect(rocqRecorder.isActive()).toBe(true);
+        // Both subgoals are still untouched.
+        expect(pendingProofCount()).toBe(2);
+        expect(drawingStore.getDrawing(subA)).toBeDefined();
+    });
+
+    it('proving a goal with no recording running advances nothing', () => {
+        drawingStore.addDrawing('Host', buildHost());
+        setActiveDrawing('Host');
+        expect(rocqRecorder.isActive()).toBe(false);
+
+        expect(() => syncProvedStatus()).not.toThrow();
+        expect(ui.activeDrawingName).toBe('Host');
+        expect(ui.proofEditorName).toBeNull();
+    });
+});
+
+describe('auto-apply equality rules', () => {
+    // A host made of a path v0 -e1-> v1 -e2-> v2: the equality rule of
+    // `buildEqualityOnlyRule` matches it and asserts v0 = v1.
+    function buildHostDrawing(): void {
+        const v0 = makeVertex(getDrawing(), 'v0');
+        const v1 = makeVertex(getDrawing(), 'v1');
+        const v2 = makeVertex(getDrawing(), 'v2');
+        makeEdge(getDrawing(), 'e1', v0, v1);
+        makeEdge(getDrawing(), 'e2', v1, v2);
+        drawingStore.addDrawing('Host', getDrawing());
+        setActiveDrawing('Host');
+    }
+
+    function equalities(): Artefact[] {
+        return getDrawing().getArtefacts().filter(a => a.sortName === 'Equality');
+    }
+
+    // A host with a single edge: too small for the three-vertex pattern of
+    // `buildNonInjectiveEqualityRule` to match injectively.
+    function buildShortHostDrawing(): void {
+        const v0 = makeVertex(getDrawing(), 'v0');
+        const v1 = makeVertex(getDrawing(), 'v1');
+        makeEdge(getDrawing(), 'e1', v0, v1);
+        drawingStore.addDrawing('Host', getDrawing());
+        setActiveDrawing('Host');
+    }
+
+    // A host whose second edge starts at a vertex that is only provably equal to
+    // the end of its first edge, so the path pattern of
+    // `buildFlexibleEqualityRule` needs flexible matching.
+    function buildDetourHostDrawing(): void {
+        const v0 = makeVertex(getDrawing(), 'v0');
+        const v1 = makeVertex(getDrawing(), 'v1');
+        const v2 = makeVertex(getDrawing(), 'v2');
+        const v3 = makeVertex(getDrawing(), 'v3');
+        makeEdge(getDrawing(), 'h1', v0, v1);
+        makeEdge(getDrawing(), 'h2', v3, v2);
+        getDrawing().newEqualityArtefact([v1, v3], 'root');
+        drawingStore.addDrawing('Host', getDrawing());
+        setActiveDrawing('Host');
+    }
+
+    function equalityLabels(): string[] {
+        return equalities()
+            .flatMap(eq => equalityChildren(eq).map(child => String(child.data.label)))
+            .sort();
+    }
+
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+        ui.toasts = [];
+        ui.autoApplyEqualityRules = false;
+        ui.filterNoProgressMatches = true;
+        ui.filterSolvesGoalMatches = false;
+        ui.filterInjectiveMatches = true;
+        ui.filterFlexibleMatches = false;
+    });
+
+    afterEach(() => {
+        ui.activeDrawingName = null;
+        ui.toasts = [];
+        ui.autoApplyEqualityRules = false;
+    });
+
+    it('is off by default, so a rule application asserts no equality of its own', () => {
+        const { rule } = buildComposableEdgesRule();
+        drawingStore.addDrawing('Comp', rule);
+        buildHostDrawing();
+
+        applyRuleAt('Comp', 0);
+
+        expect(ui.autoApplyEqualityRules).toBe(false);
+        expect(getDrawing().getArtefacts().filter(a => a.sortName === 'Edge')).toHaveLength(3);
+        expect(equalities()).toHaveLength(0);
+    });
+
+    it('applies every matching equality rule as soon as the box is checked', () => {
+        drawingStore.addDrawing('Eq', buildEqualityOnlyRule());
+        buildHostDrawing();
+
+        toggleAutoApplyEqualityRules();
+
+        expect(ui.autoApplyEqualityRules).toBe(true);
+        expect(equalities()).toHaveLength(1);
+    });
+
+    it('stops at a fixpoint and does not duplicate the asserted equality', () => {
+        drawingStore.addDrawing('Eq', buildEqualityOnlyRule());
+        buildHostDrawing();
+
+        toggleAutoApplyEqualityRules();
+        toggleAutoApplyEqualityRules();
+        toggleAutoApplyEqualityRules();
+
+        expect(equalities()).toHaveLength(1);
+    });
+
+    it('keeps going until every matching equality rule is applied', () => {
+        // 'EqEnds' asserts the two ends of every edge it matches: two
+        // applications are available, and both have to run within the pass. The
+        // two equalities overlap on v1, so the host ends up with a single
+        // equality spanning the three vertices.
+        drawingStore.addDrawing('EqEnds', buildEdgeEndpointEqualityRule());
+        buildHostDrawing();
+
+        expect(computeRuleApplications().map(e => [e.name, e.applications.length])).toEqual([['EqEnds', 2]]);
+
+        toggleAutoApplyEqualityRules();
+
+        const asserted = equalities();
+        expect(asserted).toHaveLength(1);
+        expect(equalityChildren(asserted[0]).map(a => String(a.data.label)).sort()).toEqual(['v0', 'v1', 'v2']);
+    });
+
+    it('applies equality rules after any application of any rule', () => {
+        // The flag is set directly here: this test is about the trigger firing
+        // on a rule application, not about checking the box.
+        drawingStore.addDrawing('IsMono', buildIsMonoInChildLayerRule());
+        drawingStore.addDrawing('Eq', buildEqualityOnlyRule());
+        buildHostDrawing();
+        ui.autoApplyEqualityRules = true;
+
+        expect(equalities()).toHaveLength(0);
+        applyRuleAt('IsMono', 0);
+
+        expect(getDrawing().getArtefacts().filter(a => a.sortName === 'isMono')).toHaveLength(1);
+        expect(equalities()).toHaveLength(1);
+    });
+
+    it('leaves already asserted equalities alone when the box is unchecked again', () => {
+        drawingStore.addDrawing('Eq', buildEqualityOnlyRule());
+        buildHostDrawing();
+
+        toggleAutoApplyEqualityRules();
+        toggleAutoApplyEqualityRules();
+        toggleAutoApplyEqualityRules();
+
+        expect(ui.autoApplyEqualityRules).toBe(true);
+        expect(equalities()).toHaveLength(1);
+    });
+
+    it('reaches a fixpoint even with the no-progress filter disabled', () => {
+        drawingStore.addDrawing('Eq', buildEqualityOnlyRule());
+        buildHostDrawing();
+        ui.filterNoProgressMatches = false;
+
+        toggleAutoApplyEqualityRules();
+
+        expect(equalities()).toHaveLength(1);
+    });
+
+    it('reports what it applied in a single toast, counting repeated rules', () => {
+        // 'EqEnds' matches both edges of the host, so the pass applies it twice.
+        // The second application merges into the equality the first one created,
+        // adding no artefact, so the count also guards the pass against treating
+        // a merge as a failed application.
+        drawingStore.addDrawing('EqEnds', buildEdgeEndpointEqualityRule());
+        buildHostDrawing();
+
+        toggleAutoApplyEqualityRules();
+
+        expect(ui.toasts).toHaveLength(1);
+        expect(ui.toasts[0].kind).toBe('info');
+        expect(ui.toasts[0].message).toBe('Auto-applied 2 equality rule applications:\n- EqEnds (×2)');
+    });
+
+    it('uses the singular wording for a single application', () => {
+        drawingStore.addDrawing('Eq', buildNonInjectiveEqualityRule());
+        buildShortHostDrawing();
+
+        toggleAutoApplyEqualityRules();
+
+        expect(ui.toasts.map(t => t.message)).toEqual(['Auto-applied 1 equality rule application:\n- Eq']);
+    });
+
+    it('reports the pass once when a manual application triggers it', () => {
+        drawingStore.addDrawing('IsMono', buildIsMonoInChildLayerRule());
+        drawingStore.addDrawing('Eq', buildEqualityOnlyRule());
+        buildHostDrawing();
+        ui.autoApplyEqualityRules = true;
+
+        applyRuleAt('IsMono', 0);
+
+        // The pass runs again on every application it makes; the re-entrancy
+        // guard makes all but the outermost one silent.
+        expect(ui.toasts.filter(t => t.message.startsWith('Auto-applied'))).toHaveLength(1);
+    });
+
+    it('says nothing when the pass has nothing to apply', () => {
+        drawingStore.addDrawing('Eq', buildEqualityOnlyRule());
+        buildHostDrawing();
+        toggleAutoApplyEqualityRules();
+        ui.toasts = [];
+
+        // Nothing is left to apply, whether the box is re-checked...
+        toggleAutoApplyEqualityRules();
+        toggleAutoApplyEqualityRules();
+
+        expect(ui.toasts.filter(t => t.message.startsWith('Auto-applied'))).toHaveLength(0);
+    });
+
+    it('applies a rule that has no injective match, with injective matching on', () => {
+        drawingStore.addDrawing('Eq', buildNonInjectiveEqualityRule());
+        buildShortHostDrawing();
+
+        // The panel list follows the checkboxes, so the rule is not shown here.
+        expect(computeRuleApplications().map(e => [e.name, e.applications.length])).toEqual([['Eq', 0]]);
+
+        toggleAutoApplyEqualityRules();
+
+        expect(equalityLabels()).toEqual(['v0', 'v1']);
+    });
+
+    it('applies a rule that only matches up to provable equality, with flexible matching off', () => {
+        drawingStore.addDrawing('Eq', buildFlexibleEqualityRule());
+        buildDetourHostDrawing();
+
+        expect(computeRuleApplications().map(e => [e.name, e.applications.length])).toEqual([['Eq', 0]]);
+
+        toggleAutoApplyEqualityRules();
+
+        // The host already equates v1 with v3, so the asserted equality merges
+        // with it into a single artefact.
+        expect(equalities()).toHaveLength(1);
+        expect(equalityLabels()).toEqual(['v0', 'v1', 'v2', 'v3']);
+    });
+
+    it('ignores the solves-the-goal filter', () => {
+        drawingStore.addDrawing('Eq', buildNonInjectiveEqualityRule());
+        buildShortHostDrawing();
+        // A goal no application can prove, so the panel hides every match.
+        getDrawing().addLayer('goal', 'Goal', 'root');
+        getDrawing().newArtefact('Vertex', {}, { position: [0, 0], label: 'g' }, 'goal');
+        ui.filterSolvesGoalMatches = true;
+
+        expect(computeRuleApplications().map(e => [e.name, e.applications.length])).toEqual([['Eq', 0]]);
+
+        toggleAutoApplyEqualityRules();
+
+        expect(equalityLabels()).toEqual(['v0', 'v1']);
+    });
+
+    it('does not read the injective and flexible checkboxes', () => {
+        drawingStore.addDrawing('Eq', buildNonInjectiveEqualityRule());
+        buildShortHostDrawing();
+        ui.filterInjectiveMatches = false;
+        ui.filterFlexibleMatches = true;
+
+        // The panel list now shows the match the pass would have used anyway.
+        expect(computeRuleApplications().map(e => [e.name, e.applications.length])).toEqual([['Eq', 1]]);
+
+        toggleAutoApplyEqualityRules();
+
+        expect(equalityLabels()).toEqual(['v0', 'v1']);
+    });
+
+    it('never auto-applies a rule whose child layer holds more than equalities', () => {
+        drawingStore.addDrawing('ChildEq', buildChildEqRule());
+        buildHostDrawing();
+        const before = getDrawing().getArtefacts().length;
+
+        toggleAutoApplyEqualityRules();
+
+        expect(getDrawing().getArtefacts().length).toBe(before);
+    });
+});
+
+describe('auto-unmark invalid rules', () => {
+    beforeEach(() => {
+        registerDefaultSorts(sortStore);
+        getDrawing().clear(true);
+        drawingStore.clear();
+        ui.activeDrawingName = null;
+        ui.toasts = [];
+    });
+
+    afterEach(() => {
+        ui.activeDrawingName = null;
+        ui.toasts = [];
+    });
+
+    it('unmarks a marked rule that becomes structurally invalid and pushes a toast', () => {
+        const rule = makeDrawing();
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.setIsRule(true);
+        drawingStore.addDrawing('ValidRule', rule);
+        expect(rule.isRule).toBe(true);
+
+        rule.addLayer('extra', 'Extra', null);
+        expect(rule.checkRuleConditions().isRule).toBe(false);
+
+        unmarkInvalidRules();
+
+        expect(rule.isRule).toBe(false);
+        expect(ui.toasts).toHaveLength(1);
+        expect(ui.toasts[0].kind).toBe('info');
+        expect(ui.toasts[0].message).toContain("'ValidRule'");
+    });
+
+    it('leaves a valid rule marked and pushes no toast', () => {
+        const rule = makeDrawing();
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.setIsRule(true);
+        drawingStore.addDrawing('ValidRule', rule);
+
+        unmarkInvalidRules();
+
+        expect(rule.isRule).toBe(true);
+        expect(ui.toasts).toHaveLength(0);
+    });
+});

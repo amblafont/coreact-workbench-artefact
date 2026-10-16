@@ -1,0 +1,1959 @@
+import { untrack } from 'svelte';
+import { SvelteSet } from 'svelte/reactivity';
+import * as d3 from 'd3';
+import {
+    SortStore,
+    Drawing,
+    DrawingStore,
+    Artefact,
+    findFirstOrderRuleApplications,
+    findSecondOrderRuleApplications,
+    applyFirstOrderRule,
+    applySecondOrderRule,
+    generateFirstOrderReverseRules,
+    filterRedundantRuleApplications,
+    filterNoProgressRuleApplications,
+    filterSolvesGoalRuleApplications,
+    getFirstOrderStatementChildLayer,
+    isEqualityRule,
+    computeProved,
+    type SortDefinition,
+    type Layer,
+    type DrawingStoreEntry,
+    type RuleApplication,
+    type MatchOptions,
+    type DataAttributeValue,
+    type DerivedRule,
+    getAttributeType,
+    getSliderMeta,
+    getRelativePositionMeta
+} from '../index.svelte.ts';
+import { RocqRecorder } from '../rocq_recording.svelte.ts';
+import { exportDrawingsToRocq, drawingExportNames, ruleTypeInfo, newExportRegistry, NameRegistry } from '../rocq_export';
+import type { DrawingExportNames } from '../rocq_export';
+
+// ---------------------------------------------------------------------------
+// Core singletons (reactive instances backed by fine-grained $state; derived
+// views recompute automatically whenever the signals they read change).
+// ---------------------------------------------------------------------------
+
+export const sortStore = new SortStore();
+let drawing = $state.raw(new Drawing(sortStore));
+export function getDrawing(): Drawing {
+    return drawing;
+}
+export const drawingStore = new DrawingStore();
+export const rocqRecorder = new RocqRecorder();
+
+export type ExportTarget = 'rocq';
+
+// Prover registry: one recorder per export target. Adding a prover means adding
+// its `ExportTarget` member, a tab, and an entry here; the recording plumbing
+// below (active-recorder selection, step fan-out, failure naming) is generic.
+const recorders: Array<{ target: ExportTarget; name: string; recorder: RocqRecorder }> = [
+    { target: 'rocq', name: 'Rocq', recorder: rocqRecorder }
+];
+
+export function exportTargetLabel(target: ExportTarget): string {
+    return recorders.find(r => r.target === target)?.name ?? target;
+}
+
+export interface CodeExport {
+    names: string[];
+    ruleCount: number;
+    rocq: string;
+}
+
+// The recorder that owns the live recording. With a single registered prover it
+// is always the Rocq recorder.
+export function activeRecorder(): RocqRecorder {
+    const active = activeRecorders();
+    return active.length > 0 ? active[0] : rocqRecorder;
+}
+
+function activeRecorders(): RocqRecorder[] {
+    return recorders.filter(r => r.recorder.isActive()).map(r => r.recorder);
+}
+
+function recorderName(recorder: RocqRecorder): string {
+    return recorders.find(r => r.recorder === recorder)?.name ?? 'Rocq';
+}
+
+// Run a recording step on every active recorder. Failures never roll the
+// recording back: the step's effect on the drawing stays applied and the other
+// provers keep recording. Each failure is reported by a compact toast that
+// names the failing prover.
+export function runRecorderStep(run: (recorder: RocqRecorder) => void): void {
+    for (const recorder of activeRecorders()) {
+        try {
+            run(recorder);
+        } catch (err) {
+            pushToast('error', `${recorderName(recorder)} recording failed: ${(err as Error).message}`);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interaction state (single fine-grained $state object; components read and
+// write ui.* directly and track the exact signals they touch)
+// ---------------------------------------------------------------------------
+
+export interface DraftArtefact {
+    sortName: string;
+    dependencies: Record<string, Artefact>;
+    data: Record<string, DataAttributeValue>;
+    layerId: string;
+    duplicateOf?: Artefact;
+}
+
+export type PositionPicker =
+    | { kind: 'draft'; attrName: string }
+    | { kind: 'artefact'; id: string; attrName: string };
+
+export type ToastKind = 'info' | 'error' | 'success';
+
+export interface Toast {
+    id: number;
+    kind: ToastKind;
+    message: string;
+}
+
+export const ui = $state({
+    activeDrawingName: null as string | null,
+    inspectedArtefact: null as Artefact | null,
+    draftArtefact: null as DraftArtefact | null,
+    dependencyPickingFor: null as string | null,
+    equalityExtendTarget: null as Artefact | null,
+    positionPicker: null as PositionPicker | null,
+    focusedLayerId: null as string | null,
+    mergeMode: false,
+    mergeFirstArtefact: null as Artefact | null,
+    mergeSecondArtefact: null as Artefact | null,
+    mergePickingFor: null as 'first' | 'second' | null,
+    mergeHoverArtefact: null as Artefact | null,
+    menuHoverArtefact: null as Artefact | null,
+    ruleHoverArtefacts: null as Set<Artefact> | null,
+    exportSelection: new SvelteSet<string>(),
+    toasts: [] as Toast[],
+    recordingActive: false,
+    exportTarget: 'rocq' as ExportTarget,
+    proofEditorName: null as string | null,
+    proofEditorRocqDraft: null as string | null,
+    codeExport: null as CodeExport | null,
+    drawingsStoreCollapsed: false,
+    leftPanelWidth: 270,
+    rightPanelWidth: 270,
+    rulesPanelCollapsed: true,
+    filterRedundantMatches: true,
+    filterNoProgressMatches: true,
+    filterInjectiveMatches: true,
+    filterFlexibleMatches: false,
+    filterSolvesGoalMatches: false,
+    autoApplyEqualityRules: false
+});
+
+// ---------------------------------------------------------------------------
+// Panel width persistence (localStorage, guarded for non-browser/test envs)
+// ---------------------------------------------------------------------------
+
+const PANEL_WIDTH_KEY = 'coreact.panelWidths';
+
+const PANEL_MIN = 180;
+const PANEL_MAX = 640;
+
+function clampPanelWidth(value: number | null, fallback: number): number {
+    if (value === null || Number.isNaN(value)) return fallback;
+    return Math.min(PANEL_MAX, Math.max(PANEL_MIN, Math.round(value)));
+}
+
+export function applyPersistedPanelWidths(): void {
+    if (typeof localStorage === 'undefined') return;
+    try {
+        const raw = localStorage.getItem(PANEL_WIDTH_KEY);
+        if (!raw) return;
+        const widths = JSON.parse(raw) as Partial<{ left: number; right: number }>;
+        if (typeof widths.left === 'number') ui.leftPanelWidth = clampPanelWidth(widths.left, 270);
+        if (typeof widths.right === 'number') ui.rightPanelWidth = clampPanelWidth(widths.right, 270);
+    } catch {
+        // Ignore corrupt persisted widths; keep defaults.
+    }
+}
+
+export function persistPanelWidths(): void {
+    if (typeof localStorage === 'undefined') return;
+    try {
+        localStorage.setItem(PANEL_WIDTH_KEY, JSON.stringify({ left: ui.leftPanelWidth, right: ui.rightPanelWidth }));
+    } catch {
+        // Ignore storage quota/security failures.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Toasts (non-blocking replacement for alert()/window.alert)
+// ---------------------------------------------------------------------------
+
+let nextToastId = 1;
+
+export function dismissToast(id: number): void {
+    ui.toasts = ui.toasts.filter(t => t.id !== id);
+}
+
+export function pushToast(kind: ToastKind, message: string): void {
+    const id = nextToastId++;
+    ui.toasts = [...ui.toasts, { id, kind, message }];
+    setTimeout(() => dismissToast(id), kind === 'error' ? 8000 : 4000);
+}
+
+// ---------------------------------------------------------------------------
+// Derived collections (reactively recomputed by callers from the signals they
+// read: drawing artefacts/layers, the drawing store, and the recorder).
+// ---------------------------------------------------------------------------
+
+export function allArtefacts(): Artefact[] {
+    return drawing.getArtefacts();
+}
+export function allLayers(): Layer[] {
+    return drawing.getAllLayers();
+}
+export interface StoreDrawing extends DrawingStoreEntry {
+    isRule: boolean;
+    isFirstOrder: boolean;
+}
+
+export function allDrawings(): StoreDrawing[] {
+    return drawingStore.getAllDrawings().map(entry => ({
+        ...entry,
+        isRule: entry.drawing.isRule,
+        isFirstOrder: drawingStore.checkIsFirstOrder(entry.drawing)
+    }));
+}
+
+export type RuleTag = { kind: 'invalid'; reason: string } | { kind: 'first' } | { kind: 'second' };
+
+export function ruleTag(): RuleTag | null {
+    if (!drawing.isRule) return null;
+    const check = drawing.checkRuleConditions();
+    if (!check.isRule) {
+        return { kind: 'invalid', reason: check.reason ?? 'Unknown reason' } satisfies RuleTag;
+    }
+    return drawingStore.checkIsFirstOrder(drawing)
+        ? ({ kind: 'first' } satisfies RuleTag)
+        : ({ kind: 'second' } satisfies RuleTag);
+}
+
+export function unmarkInvalidRules(): void {
+    for (const entry of drawingStore.getAllDrawings()) {
+        const target = entry.drawing;
+        if (!target.isRule) continue;
+        const check = target.checkRuleConditions();
+        if (!check.isRule) {
+            target.setIsRule(false);
+            pushToast('info', `Drawing '${entry.name}' is no longer a valid rule and has been unmarked: ${check.reason ?? 'unknown reason'}`);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Position picker helpers
+// ---------------------------------------------------------------------------
+
+function setBodyCursor(cursor: string): void {
+    if (typeof document === 'undefined') return;
+    d3.select('body').style('cursor', cursor);
+}
+
+export function stopPositionPicker(): void {
+    ui.positionPicker = null;
+    setBodyCursor('default');
+}
+
+export function startPositionPicker(target: PositionPicker): void {
+    ui.positionPicker = target;
+    setBodyCursor('crosshair');
+}
+
+function resolvePickerTarget(picker: PositionPicker):
+    { sortName: string; data: Record<string, DataAttributeValue>; dependencies: Record<string, Artefact>; isDraft: boolean } | null {
+    if (picker.kind === 'draft') {
+        const draft = ui.draftArtefact;
+        if (!draft) return null;
+        return { sortName: draft.sortName, data: draft.data, dependencies: draft.dependencies, isDraft: true };
+    }
+    const artefact = drawing.getArtefactById(picker.id);
+    if (!artefact) return null;
+    return { sortName: artefact.sortName, data: artefact.data, dependencies: artefact.dependencies, isDraft: false };
+}
+
+export function applyPickedPosition(x: number, y: number): void {
+    const picker = ui.positionPicker;
+    if (!picker) return;
+    const target = resolvePickerTarget(picker);
+    if (!target) {
+        stopPositionPicker();
+        return;
+    }
+    const sortDef = sortStore.getSort(target.sortName);
+    const attrType = sortDef?.attributes[picker.attrName];
+    const { isDraft } = target;
+
+    if (attrType && getAttributeType(attrType) === 'relativePosition') {
+        const rpMeta = getRelativePositionMeta(attrType);
+        if (rpMeta) {
+            const [depKey, fieldPath] = rpMeta.target.split(".");
+            const depArtefact = target.dependencies[depKey];
+            if (depArtefact) {
+                const depSortDef = sortStore.getSort(depArtefact.sortName);
+                const depResolved = depArtefact.getResolvedData(undefined, undefined, depSortDef, (n) => sortStore.getSort(n));
+                let depPos: any = depResolved;
+                for (const seg of fieldPath.split('.')) depPos = depPos?.[seg];
+                if (Array.isArray(depPos) && depPos.length === 2) {
+                    const value: [number, number] = [x - depPos[0], y - depPos[1]];
+                    if (isDraft) {
+                        setDraftDataField(picker.attrName, value);
+                    } else {
+                        target.data[picker.attrName] = value;
+
+                    }
+                    stopPositionPicker();
+                    return;
+                }
+            }
+        }
+    }
+    if (isDraft) {
+        setDraftDataField(picker.attrName, [x, y]);
+        finalizeDraftIfComplete();
+    } else {
+        target.data[picker.attrName] = [x, y];
+
+    }
+    stopPositionPicker();
+}
+
+export function getSinglePositionAttr(sortDef: SortDefinition): string | null {
+    const positionAttrs = Object.entries(sortDef.attributes)
+        .filter(([_, type]) => getAttributeType(type) === 'position')
+        .map(([name]) => name);
+    return positionAttrs.length === 1 ? positionAttrs[0] : null;
+}
+
+export function isPositionPickerActive(artefact: Artefact, attrName: string): boolean {
+    const picker = ui.positionPicker;
+    if (!picker) return false;
+    if (picker.attrName !== attrName) return false;
+    return picker.kind === 'artefact' && picker.id === artefact.id;
+}
+
+export function isDraftPickerActive(attrName: string): boolean {
+    const picker = ui.positionPicker;
+    if (!picker) return false;
+    return picker.kind === 'draft' && picker.attrName === attrName;
+}
+
+export function togglePositionPicker(artefact: Artefact, attrName: string): void {
+    if (isPositionPickerActive(artefact, attrName)) {
+        stopPositionPicker();
+    } else {
+        startPositionPicker({ kind: 'artefact', id: artefact.id, attrName });
+    }
+}
+
+export function toggleDraftPicker(attrName: string): void {
+    if (isDraftPickerActive(attrName)) {
+        stopPositionPicker();
+    } else {
+        startPositionPicker({ kind: 'draft', attrName });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Draft artefact helpers (mutations go through `update` so subscribers fire)
+// ---------------------------------------------------------------------------
+
+export function findNextUnfilledDependency(draft: DraftArtefact): string | null {
+    const sortDef = sortStore.getSort(draft.sortName);
+    if (!sortDef) return null;
+    for (const [depKey] of Object.entries(sortDef.dependencies)) {
+        if (!draft.dependencies[depKey]) {
+            return depKey;
+        }
+    }
+    return null;
+}
+
+export function setDraftDataField(name: string, value: DataAttributeValue): void {
+    const d = ui.draftArtefact;
+    if (!d) return;
+    const nextData = { ...d.data };
+    if (name === 'label' && value === '') {
+        delete nextData[name];
+    } else {
+        nextData[name] = value;
+    }
+    ui.draftArtefact = { ...d, data: nextData };
+}
+
+export function setDraftLayer(layerId: string): void {
+    const d = ui.draftArtefact;
+    if (!d) return;
+    ui.draftArtefact = { ...d, layerId };
+}
+
+export function startDraftForSort(sortDef: SortDefinition): void {
+    ui.inspectedArtefact = null;
+    ui.equalityExtendTarget = null;
+    cancelMergeMode();
+
+    const initialData: Record<string, DataAttributeValue> = {};
+    for (const [attrName, attrType] of Object.entries(sortDef.attributes)) {
+        const typeName = getAttributeType(attrType);
+        if (typeName === 'position') {
+            initialData[attrName] = [300, 300];
+        } else if (typeName === 'relativePosition') {
+            initialData[attrName] = [0, 0];
+        } else if (typeName === 'slider') {
+            const meta = getSliderMeta(attrType);
+            initialData[attrName] = meta ? meta.default : 0;
+        } else if (typeName === 'number') {
+            initialData[attrName] = attrName === 'bend' ? 0 : 2;
+        } else if (typeName === 'boolean') {
+            initialData[attrName] = false;
+        } else if (typeName === 'string') {
+            initialData[attrName] = '';
+        }
+    }
+
+    const focusedId = drawing.getFocusedLayerId();
+    const allLayersList = drawing.getAllLayers();
+    const defaultLayerId = focusedId || (allLayersList.length > 0 ? allLayersList[0].id : 'root');
+
+    const draft: DraftArtefact = {
+        sortName: sortDef.name,
+        dependencies: {},
+        data: initialData,
+        layerId: defaultLayerId
+    };
+    ui.draftArtefact = draft;
+    stopPositionPicker();
+
+    if (sortDef.name === 'Equality') {
+        ui.dependencyPickingFor = 'Equality';
+    } else {
+        const firstDep = findNextUnfilledDependency(draft);
+        ui.dependencyPickingFor = firstDep;
+        if (firstDep) {
+            const expectedSort = sortDef.dependencies[firstDep];
+            const pickableCount = drawing.getArtefacts()
+                .filter(a => a.sortName === expectedSort)
+                .filter(a => !focusedId || a.layerId === focusedId)
+                .length;
+            if (pickableCount === 0) {
+                pushToast('info', `No '${expectedSort}' artefacts to pick yet — create one first.`);
+            }
+        }
+    }
+
+    const singlePositionAttr = getSinglePositionAttr(sortDef);
+    if (singlePositionAttr) {
+        startPositionPicker({ kind: 'draft', attrName: singlePositionAttr });
+    }
+
+
+}
+
+export function startDuplicateArtefact(art: Artefact): void {
+    if (art.sortName === 'Equality') {
+        pushToast('error', 'Cannot duplicate an equality artefact.');
+        return;
+    }
+    const sortDef = sortStore.getSort(art.sortName);
+    if (!sortDef) {
+        pushToast('error', `Sort '${art.sortName}' is not defined.`);
+        return;
+    }
+
+    ui.inspectedArtefact = null;
+    cancelMergeMode();
+    stopPositionPicker();
+
+    const copiedData: Record<string, DataAttributeValue> = JSON.parse(JSON.stringify(art.data));
+
+    const draft: DraftArtefact = {
+        sortName: art.sortName,
+        dependencies: {},
+        data: copiedData,
+        layerId: art.layerId,
+        duplicateOf: art
+    };
+    ui.draftArtefact = draft;
+
+    const firstDep = findNextUnfilledDependency(draft);
+    ui.dependencyPickingFor = firstDep;
+
+
+}
+
+export function duplicateArtefactNode(art: Artefact): void {
+    startDuplicateArtefact(art);
+}
+
+export function cancelDraft(): void {
+    ui.draftArtefact = null;
+    ui.dependencyPickingFor = null;
+    stopPositionPicker();
+
+}
+
+export function createDraftArtefact(): Artefact | null {
+    const draft = ui.draftArtefact;
+    if (!draft) return null;
+    try {
+        const finalDeps: Record<string, Artefact> = { ...draft.dependencies };
+        let created: Artefact;
+        if (draft.duplicateOf) {
+            const dupResult = drawing.duplicateArtefact(draft.duplicateOf, finalDeps, draft.data, draft.layerId);
+            created = dupResult.artefact;
+            const activeName = ui.activeDrawingName ?? 'Unsaved Drawing';
+            runRecorderStep(recorder => {
+                recorder.recordDuplicate(drawing, draft.duplicateOf!, created, activeName, sortStore);
+            });
+        } else {
+            created = drawing.newArtefact(draft.sortName, finalDeps, draft.data, draft.layerId);
+        }
+        ui.draftArtefact = null;
+        ui.dependencyPickingFor = null;
+        stopPositionPicker();
+
+        return created;
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+        return null;
+    }
+}
+
+export function finalizeDraftIfComplete(): Artefact | null {
+    const draft = ui.draftArtefact;
+    if (!draft) return null;
+    if (!isDraftComplete(draft)) return null;
+    const created = createDraftArtefact();
+    if (created) {
+        selectArtefactToInspect(created);
+    }
+    return created;
+}
+
+export function isDraftComplete(draft: DraftArtefact): boolean {
+    const sortDef = sortStore.getSort(draft.sortName);
+    if (!sortDef) return false;
+    if (draft.sortName === 'Equality') {
+        return equalityChildren(draft).length >= 2;
+    }
+    for (const [depKey] of Object.entries(sortDef.dependencies)) {
+        if (!draft.dependencies[depKey]) {
+            return false;
+        }
+    }
+    for (const [attrName, _] of Object.entries(sortDef.attributes)) {
+        if (draft.data[attrName] === undefined) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Merge helpers
+// ---------------------------------------------------------------------------
+
+export function startMergeMode(preselectFirst: Artefact | null = null): void {
+    ui.draftArtefact = null;
+    ui.dependencyPickingFor = null;
+    ui.equalityExtendTarget = null;
+    ui.mergeHoverArtefact = null;
+    stopPositionPicker();
+
+    ui.mergeMode = true;
+    if (preselectFirst && drawing.getArtefacts().includes(preselectFirst)) {
+        ui.mergeFirstArtefact = preselectFirst;
+        ui.mergeSecondArtefact = null;
+        ui.mergePickingFor = 'second';
+    } else {
+        ui.mergeFirstArtefact = null;
+        ui.mergeSecondArtefact = null;
+        ui.mergePickingFor = 'first';
+    }
+
+}
+
+export function cancelMergeMode(): void {
+    ui.mergeMode = false;
+    ui.mergeFirstArtefact = null;
+    ui.mergeSecondArtefact = null;
+    ui.mergePickingFor = null;
+    ui.mergeHoverArtefact = null;
+
+}
+
+export function selectMergeArtefact(artefact: Artefact): void {
+    ui.mergeHoverArtefact = null;
+    const first = ui.mergeFirstArtefact;
+    const pickingFor = ui.mergePickingFor;
+    if (pickingFor === 'first' || !first) {
+        ui.mergeFirstArtefact = artefact;
+        if (ui.mergeSecondArtefact === artefact) {
+            ui.mergeSecondArtefact = null;
+        }
+        ui.mergePickingFor = 'second';
+    } else if (pickingFor === 'second' || first) {
+        if (artefact === first) {
+            pushToast('error', 'Cannot merge an artefact with itself.');
+        } else if (!drawing.areDependenciesEqual(first, artefact)) {
+            pushToast('error', `Cannot merge: Artefact '${artefact.data.label || artefact.sortName}' does not have matching dependencies.`);
+        } else if (isRecordedMerge(first, artefact) && !drawing.areProvablyEqual(first, artefact)) {
+            pushToast('error', `Cannot merge during proof recording: Artefact '${artefact.data.label || artefact.sortName}' is not provably equal to '${first.data.label || first.sortName}'.`);
+        } else {
+            ui.mergeSecondArtefact = artefact;
+            ui.mergePickingFor = null;
+        }
+    }
+
+}
+
+export interface FieldRename {
+    from: string;
+    to: string;
+}
+
+// The layers whose artefacts are binders of the recorded lemma type: the root
+// layer and the statement's conclusion layer. Premise layers are inlined as
+// `assert`s instead, so their artefacts have no binder to rename.
+function isRecordedLayer(layerId: string): boolean {
+    if (drawing.getLayer(layerId)?.parentId === null) {
+        return true;
+    }
+    return layerId === getFirstOrderStatementChildLayer(drawing)?.id;
+}
+
+// A merge whose survivor sits on a recorded layer is written to the proof as
+// `rename` steps, which only make sense when the context already proves the two
+// artefacts equal.
+export function isRecordedMerge(_a: Artefact, b: Artefact): boolean {
+    return activeRecorders().length > 0 && isRecordedLayer(b.layerId);
+}
+
+// Whether `a` and `b` may be merged. Outside a recording (or on a layer that is
+// not recorded) any pair with matching dependencies may be merged; that asserts
+// a new equality. A merge that would emit `rename` steps additionally requires
+// the two artefacts to be already provably equal.
+export function canMergeArtefacts(a: Artefact, b: Artefact): boolean {
+    if (a === b || !drawing.areDependenciesEqual(a, b)) return false;
+    if (isRecordedMerge(a, b) && !drawing.areProvablyEqual(a, b)) return false;
+    return true;
+}
+
+// The `rename` steps that bring a recorded proof back in sync with the exported
+// names of a drawing whose artefacts changed. Every field name in the proof is a
+// binder the script already holds, so a rename is only legal once its target is
+// free: the removed artefact's name is gone from the export registry but still
+// taken in the script, hence the move aside before the renames that want it.
+function planFieldRenames(before: DrawingExportNames, after: DrawingExportNames, removedId: string): FieldRename[] {
+    const occupied = new Set<string>(before.fieldNames.values());
+    for (const names of before.equalityFieldNames.values()) {
+        for (const name of names) {
+            occupied.add(name);
+        }
+    }
+
+    const pending: FieldRename[] = [];
+    for (const [id, to] of after.fieldNames) {
+        const from = before.fieldNames.get(id);
+        if (from && from !== to) {
+            pending.push({ from, to });
+        }
+    }
+
+    const renames: FieldRename[] = [];
+    const removedName = before.fieldNames.get(removedId);
+    if (removedName && pending.some(rename => rename.to === removedName)) {
+        const aside = new NameRegistry(occupied).unique('Hmerged');
+        renames.push({ from: removedName, to: aside });
+        occupied.delete(removedName);
+        occupied.add(aside);
+    }
+
+    // Every emitted rename frees its source, so emitting only the renames whose
+    // target is already free drains the queue; anything left would need a name
+    // that never frees up and is left unrecorded.
+    for (let progress = true; progress;) {
+        progress = false;
+        for (let i = 0; i < pending.length; i++) {
+            const rename = pending[i];
+            if (occupied.has(rename.to)) {
+                continue;
+            }
+            renames.push(rename);
+            occupied.delete(rename.from);
+            occupied.add(rename.to);
+            pending.splice(i, 1);
+            progress = true;
+            break;
+        }
+    }
+
+    return renames;
+}
+
+export function performMerge(): void {
+    const first = ui.mergeFirstArtefact;
+    const second = ui.mergeSecondArtefact;
+    if (!first || !second || !canMergeArtefacts(first, second)) return;
+    try {
+        const activeName = ui.activeDrawingName ?? 'Unsaved Drawing';
+        const before = isRecordedMerge(first, second)
+            ? drawingExportNames(drawing, activeName, sortStore)
+            : null;
+        const mergedResult = drawing.mergeArtefacts(first, second);
+        if (before) {
+            const renames = planFieldRenames(before, drawingExportNames(drawing, activeName, sortStore), first.id);
+            if (renames.length > 0) {
+                runRecorderStep(recorder => {
+                    for (const rename of renames) {
+                        recorder.recordRename(rename.from, rename.to, activeName);
+                    }
+                });
+            }
+        }
+        ui.mergeMode = false;
+        ui.mergeFirstArtefact = null;
+        ui.mergeSecondArtefact = null;
+        ui.mergePickingFor = null;
+        ui.mergeHoverArtefact = null;
+        ui.inspectedArtefact = mergedResult;
+
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function mergeBaseOpacityFor(art: Artefact): number {
+    const first = ui.mergeFirstArtefact;
+    if (art === first || art === ui.mergeSecondArtefact) {
+        return 1.0;
+    }
+    if (first && drawing.areDependenciesEqual(first, art)) {
+        if (drawing.areProvablyEqual(first, art)) {
+            return 1.0;
+        }
+        // A merge that would be recorded requires provable equality, so such a
+        // candidate is not selectable and is dimmed like a non-candidate.
+        return isRecordedMerge(first, art) ? 0.35 : 0.85;
+    }
+    if (!first) {
+        return 0.85;
+    }
+    return 0.35;
+}
+
+export function isDuplicateEligible(art: Artefact): boolean {
+    const draft = ui.draftArtefact;
+    const picking = ui.dependencyPickingFor;
+    if (!draft?.duplicateOf || !picking) return false;
+    const sortDef = sortStore.getSort(draft.sortName);
+    const expectedSort = sortDef?.dependencies[picking];
+    if (!expectedSort || art.sortName !== expectedSort) return false;
+    const origDep = draft.duplicateOf.dependencies[picking];
+    if (!origDep) return false;
+    return drawing.areEqual(origDep, art, draft.layerId);
+}
+
+export function isProvablyEqualCandidate(art: Artefact): boolean {
+    const first = ui.mergeFirstArtefact;
+    if (ui.mergeMode && !!first && art !== first
+        && drawing.areDependenciesEqual(first, art)
+        && drawing.areProvablyEqual(first, art)) {
+        return true;
+    }
+    return isDuplicateEligible(art);
+}
+
+// ---------------------------------------------------------------------------
+// Misc helpers
+// ---------------------------------------------------------------------------
+
+export function getArtefactLabel(art: Artefact): string {
+    if (art.sortName === 'Equality') {
+        const joined = equalityChildren(art)
+            .map(c => c.data.label || c.sortName)
+            .join(' = ');
+        if (joined) return joined;
+    }
+    if (art.data.label) return art.data.label;
+    return '(unnamed)';
+}
+
+export function equalityChildren(art: { dependencies: Record<string, Artefact> }): Artefact[] {
+    return Object.values(art.dependencies);
+}
+
+// ---------------------------------------------------------------------------
+// Drawing / rule helpers used by the UI
+// ---------------------------------------------------------------------------
+
+export function resetInteractionState(): void {
+    ui.inspectedArtefact = null;
+    ui.focusedLayerId = null;
+    drawing.setFocusedLayer(null);
+    ui.draftArtefact = null;
+    ui.dependencyPickingFor = null;
+    ui.equalityExtendTarget = null;
+    ui.mergeMode = false;
+    ui.mergeFirstArtefact = null;
+    ui.mergeSecondArtefact = null;
+    ui.mergePickingFor = null;
+    ui.mergeHoverArtefact = null;
+    ui.menuHoverArtefact = null;
+    ui.ruleHoverArtefacts = null;
+    stopPositionPicker();
+}
+
+export function setActiveDrawing(name: string): boolean {
+    try {
+        const entry = drawingStore.getDrawing(name);
+        if (!entry) {
+            pushToast('error', `Drawing '${name}' does not exist.`);
+            return false;
+        }
+        drawing.forgetSvgRefs();
+        drawing = entry.drawing;
+        ui.activeDrawingName = name;
+        resetInteractionState();
+        syncProvedStatus();
+        return true;
+    } catch (err) {
+        pushToast('error', `Error opening drawing:\n${(err as Error).message}`);
+        return false;
+    }
+}
+
+export function getSelectedDrawingNames(): string[] {
+    const existing = new Set(drawingStore.getAllNames());
+    return Array.from(ui.exportSelection).filter(name => existing.has(name));
+}
+
+export function downloadDrawingsJson(names: string[]): void {
+    try {
+        const jsonStr = drawingStore.exportDrawingsJSON(names);
+        const blob = new Blob([jsonStr], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'drawings.json';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    } catch (err) {
+        pushToast('error', `Error exporting drawings:\n${(err as Error).message}`);
+    }
+}
+
+export function openCodeExport(names: string[]): void {
+    try {
+        const drawings: DrawingStoreEntry[] = names
+            .map(name => drawingStore.getDrawing(name))
+            .filter((d): d is DrawingStoreEntry => !!d);
+        if (drawings.length === 0) {
+            pushToast('error', 'Error exporting drawings:\nNo drawings found in the store.');
+            return;
+        }
+        const rocq = exportDrawingsToRocq(drawings, sortStore);
+        const ruleCount = drawings.filter(d => d.drawing.isRule).length;
+        ui.codeExport = { names, ruleCount, rocq };
+    } catch (err) {
+        pushToast('error', `Error exporting drawings:\n${(err as Error).message}`);
+    }
+}
+
+export function closeCodeExport(): void {
+    ui.codeExport = null;
+}
+
+export async function copyCodeToClipboard(code: string, target: ExportTarget, ruleCount: number): Promise<void> {
+    try {
+        await navigator.clipboard.writeText(code);
+        pushToast('info', `Exported ${ruleCount} rule${ruleCount === 1 ? '' : 's'} to ${exportTargetLabel(target)}.`);
+    } catch {
+        pushToast('error', 'Error exporting drawings:\nClipboard access failed.');
+    }
+}
+
+export function uniqueProofDrawingName(baseName: string): string {
+    let candidate = `${baseName} (proof)`;
+    let n = 2;
+    while (drawingStore.getDrawing(candidate)) {
+        candidate = `${baseName} (proof) (${n})`;
+        n++;
+    }
+    return candidate;
+}
+
+export function splitFirstOrderRecording(name: string, snapshot: Drawing, rocqScript: string | null): { proofName: string } {
+    if (getFirstOrderStatementChildLayer(snapshot) === null) {
+        throw new Error(`Consistency Check Failed: Drawing '${name}' is not a first-order statement; the recording cannot be attached as a rule proof.`);
+    }
+    const entry = drawingStore.getDrawing(name);
+    if (!entry) {
+        throw new Error(`Consistency Check Failed: Drawing '${name}' does not exist; the recording cannot be attached as a rule proof.`);
+    }
+    const parent = entry.parentName;
+    const proofName = uniqueProofDrawingName(name);
+    if (rocqScript) {
+        snapshot.setRocqProof(rocqScript);
+    }
+    snapshot.setIsRule(true);
+    drawingStore.renameDrawing(name, proofName);
+    if (ui.activeDrawingName === name) {
+        ui.activeDrawingName = proofName;
+    }
+    if (ui.exportSelection.has(name)) {
+        ui.exportSelection.delete(name);
+        ui.exportSelection.add(proofName);
+    }
+    drawingStore.addDrawing(name, snapshot);
+    if (parent) {
+        drawingStore.setDrawingParent(name, parent);
+    }
+    return { proofName };
+}
+
+export function openProofEditor(name: string, drafts?: { rocq?: string }): void {
+    ui.proofEditorName = name;
+    ui.proofEditorRocqDraft = drafts?.rocq ?? null;
+}
+
+export function closeProofEditor(): void {
+    ui.proofEditorName = null;
+    ui.proofEditorRocqDraft = null;
+}
+
+function setDrawingProof(name: string, target: ExportTarget, script: string): void {
+    const entry = drawingStore.getDrawing(name);
+    if (!entry) {
+        pushToast('error', `Drawing '${name}' does not exist.`);
+        return;
+    }
+    const trimmed = script.trim();
+    switch (target) {
+        case 'rocq':
+            entry.drawing.setRocqProof(trimmed ? script : null);
+            break;
+    }
+    pushToast('info', trimmed ? `Proof of '${name}' updated.` : `Proof removed from '${name}'.`);
+}
+
+export function updateDrawingProof(name: string, target: ExportTarget, script: string): void {
+    try {
+        setDrawingProof(name, target, script);
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function removeDrawingProofs(name: string): void {
+    try {
+        const entry = drawingStore.getDrawing(name);
+        if (!entry) {
+            pushToast('error', `Drawing '${name}' does not exist.`);
+            return;
+        }
+        entry.drawing.setRocqProof(null);
+        pushToast('info', `Proofs removed from '${name}'.`);
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function buildAdmittedProof(drawing: Drawing, name: string, sortStore: SortStore, target: ExportTarget): string {
+    const exportNames = drawingExportNames(drawing, name, sortStore);
+    const info = ruleTypeInfo(drawing, name, sortStore, newExportRegistry(sortStore), { reserveParam: false, includePremises: false });
+    switch (target) {
+        case 'rocq':
+            return `Lemma ${exportNames.moduleName}_rule : ${info.type}.\nProof.\n  admit.\nAdmitted.`;
+    }
+}
+
+export function suggestAdmittedProof(name: string): void {
+    try {
+        const entry = drawingStore.getDrawing(name);
+        if (!entry) {
+            pushToast('error', `Drawing '${name}' does not exist.`);
+            return;
+        }
+        const rocq = buildAdmittedProof(entry.drawing, name, sortStore, 'rocq');
+        openProofEditor(name, { rocq });
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Artefact inspection / data editing helpers
+// ---------------------------------------------------------------------------
+
+export function selectArtefactToInspect(art: Artefact): void {
+    const nowInspected = ui.inspectedArtefact !== art;
+    ui.inspectedArtefact = nowInspected ? art : null;
+    if (nowInspected) {
+        ui.draftArtefact = null;
+        ui.dependencyPickingFor = null;
+        stopPositionPicker();
+    }
+
+}
+
+export function setArtefactDataField(art: Artefact, name: string, value: DataAttributeValue): void {
+    if (name === 'label' && value === '') {
+        delete art.data.label;
+    } else {
+        art.data[name] = value;
+    }
+
+}
+
+export function setInspectedLabel(art: Artefact, rawLabel: string): void {
+    const target = rawLabel.trim();
+    const activeName = ui.activeDrawingName ?? 'Unsaved Drawing';
+    const isRootLayer = art.layerId === 'root' || drawing.getLayer(art.layerId)?.parentId === null;
+    let oldFieldName: string | null = null;
+    if (activeRecorders().length > 0 && isRootLayer) {
+        const oldExport = drawingExportNames(drawing, activeName, sortStore);
+        oldFieldName = oldExport.fieldNames.get(art.id) ?? null;
+    }
+    if (target === '') {
+        delete art.data.label;
+    } else {
+        art.data.label = target;
+    }
+    if (activeRecorders().length > 0 && isRootLayer && oldFieldName !== null) {
+        const newExport = drawingExportNames(drawing, activeName, sortStore);
+        const newFieldName = newExport.fieldNames.get(art.id);
+        if (newFieldName && newFieldName !== oldFieldName) {
+            const from = oldFieldName;
+            const to = newFieldName;
+            runRecorderStep(recorder => {
+                recorder.recordRename(from, to, activeName);
+            });
+        }
+    }
+
+}
+
+export function setArtefactLayer(art: Artefact, targetLayerId: string): void {
+    drawing.setArtefactLayer(art, targetLayerId);
+
+}
+
+function autoSelectLayerFromDependencies(): void {
+    const draft = ui.draftArtefact;
+    if (!draft) return;
+    const depLayerIds = Object.values(draft.dependencies).map(d => d.layerId);
+    if (depLayerIds.length === 0) return;
+    const best = drawing.getBestLayerForDependencies(depLayerIds);
+    if (best && best !== draft.layerId) {
+        setDraftLayer(best);
+    }
+}
+
+export function pickDraftDependency(artefact: Artefact): void {
+    const draft = ui.draftArtefact;
+    const picking = ui.dependencyPickingFor;
+    if (!draft || !picking) return;
+
+    if (draft.sortName === 'Equality') {
+        const existingItems = equalityChildren(draft);
+        if (existingItems.length > 0 && existingItems[0].sortName !== artefact.sortName) {
+            pushToast('error', `Equality artefact requires all elements to be of sort '${existingItems[0].sortName}', but selected '${artefact.sortName}'.`);
+            return;
+        }
+        const nextIdx = Object.keys(draft.dependencies).length;
+        ui.draftArtefact = { ...draft, dependencies: { ...draft.dependencies, [`${nextIdx}`]: artefact } };
+
+        autoSelectLayerFromDependencies();
+        return;
+    }
+
+    const sortDef = sortStore.getSort(draft.sortName);
+    const expectedSort = sortDef?.dependencies[picking];
+    if (expectedSort && artefact.sortName === expectedSort) {
+        if (draft.duplicateOf) {
+            const origDep = draft.duplicateOf.dependencies[picking];
+            if (!origDep) {
+                pushToast('error', `Original artefact is missing dependency '${picking}'.`);
+                return;
+            }
+            if (!drawing.areEqual(origDep, artefact, draft.layerId)) {
+                pushToast('error', `Selected dependency '${artefact.data.label || artefact.sortName}' is not provably equal to the original dependency '${origDep.data.label || origDep.sortName}'.`);
+                return;
+            }
+        }
+        if (draft) {
+            ui.draftArtefact = { ...draft, dependencies: { ...draft.dependencies, [picking]: artefact } };
+        }
+        ui.dependencyPickingFor = findNextUnfilledDependency(ui.draftArtefact as DraftArtefact);
+
+        // Auto-activate picker for relativePosition attrs targeting this dep key
+        if (sortDef) {
+            for (const [attrName, attrType] of Object.entries(sortDef.attributes)) {
+                if (getAttributeType(attrType) !== 'relativePosition') continue;
+                const rpMeta = getRelativePositionMeta(attrType);
+                if (!rpMeta || rpMeta.target.split('.')[0] !== picking) continue;
+                startPositionPicker({ kind: 'draft', attrName });
+                break;
+            }
+        }
+        autoSelectLayerFromDependencies();
+        finalizeDraftIfComplete();
+    } else {
+        pushToast('error', `Expected sort '${expectedSort}', but selected '${artefact.sortName}'.`);
+    }
+}
+
+export function toggleEqualityExtend(eq: Artefact): void {
+    if (eq.sortName !== 'Equality') return;
+    if (ui.equalityExtendTarget === eq) {
+        ui.equalityExtendTarget = null;
+        return;
+    }
+    ui.equalityExtendTarget = eq;
+    ui.dependencyPickingFor = null;
+}
+
+export function pickEqualityDependency(art: Artefact): void {
+    const eq = ui.equalityExtendTarget;
+    if (!eq || art === eq) return;
+    const children = equalityChildren(eq);
+    if (children.length > 0 && children[0].sortName !== art.sortName) {
+        pushToast('error', `Equality artefact requires all elements to be of sort '${children[0].sortName}', but selected '${art.sortName}'.`);
+        return;
+    }
+    try {
+        const result = drawing.newEqualityArtefact([...children, art], eq.layerId);
+        const resolved = drawing.getArtefactById(eq.id);
+        if (!resolved) {
+            ui.equalityExtendTarget = result;
+        }
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function removeArtefactNode(artefact: Artefact, parentArtefact: Artefact | null = null): void {
+    if (parentArtefact && parentArtefact.sortName === 'Equality') {
+        drawing.removeEqualityChild(parentArtefact, artefact);
+    } else {
+        drawing.removeArtefact(artefact);
+    }
+    pruneStaleArtefactRefs();
+
+}
+
+// Clear interaction state that references artefacts no longer present in the
+// drawing. This is a validity sweep rather than a check against the removed
+// artefact on purpose: removeArtefact also removes every transitive dependent,
+// so the inspected/picked artefact can disappear as collateral without being
+// the node the user deleted.
+function pruneStaleArtefactRefs(): void {
+    const inspected = ui.inspectedArtefact;
+    if (inspected && !drawing.getArtefactById(inspected.id)) {
+        ui.inspectedArtefact = null;
+    }
+    const extendTarget = ui.equalityExtendTarget;
+    if (extendTarget && !drawing.getArtefactById(extendTarget.id)) {
+        ui.equalityExtendTarget = null;
+    }
+    const picker = ui.positionPicker;
+    if (picker?.kind === 'artefact' && !drawing.getArtefactById(picker.id)) {
+        stopPositionPicker();
+    }
+}
+
+function hasSameSortLayerNeighbour(artefact: Artefact, delta: -1 | 1): boolean {
+    const arts = drawing.getArtefacts();
+    const idx = arts.indexOf(artefact);
+    if (idx === -1) return false;
+    let i = idx + delta;
+    while (i >= 0 && i < arts.length) {
+        const other = arts[i];
+        if (other.sortName === artefact.sortName && other.layerId === artefact.layerId) return true;
+        i += delta;
+    }
+    return false;
+}
+
+export function canMoveArtefactUp(artefact: Artefact): boolean {
+    return hasSameSortLayerNeighbour(artefact, -1);
+}
+
+export function canMoveArtefactDown(artefact: Artefact): boolean {
+    return hasSameSortLayerNeighbour(artefact, 1);
+}
+
+export function moveArtefactUp(artefact: Artefact): void {
+    try {
+        drawing.moveArtefact(artefact, -1);
+
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function moveArtefactDown(artefact: Artefact): void {
+    try {
+        drawing.moveArtefact(artefact, 1);
+
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function onArtefactNodeClick(art: Artefact): void {
+    if (ui.mergeMode) {
+        selectMergeArtefact(art);
+        return;
+    }
+    if (ui.equalityExtendTarget) {
+        if (art.sortName === 'Equality' && art !== ui.equalityExtendTarget && drawing.getArtefacts().includes(art)) {
+            toggleEqualityExtend(art);
+        } else {
+            pickEqualityDependency(art);
+        }
+        return;
+    }
+    if (ui.dependencyPickingFor && ui.draftArtefact) {
+        pickDraftDependency(art);
+        return;
+    }
+    selectArtefactToInspect(art);
+}
+
+// ---------------------------------------------------------------------------
+// Drawing store / rule / recording app actions
+// ---------------------------------------------------------------------------
+
+export interface RecordedStatementInfo {
+    drawingName: string;
+    lemmaName: string;
+    proved: boolean;
+    isMain: boolean;
+}
+
+export function recordedStatements(): RecordedStatementInfo[] {
+    return activeRecorder().getRecordedStatements();
+}
+
+export function recordedStatementByDrawing(): Map<string, RecordedStatementInfo> {
+    const map = new Map<string, RecordedStatementInfo>();
+    for (const s of activeRecorder().getRecordedStatements()) {
+        map.set(s.drawingName, s);
+    }
+    return map;
+}
+
+export function pendingProofCount(): number {
+    return activeRecorder().getRecordedStatements().filter(s => !s.isMain && !s.proved).length;
+}
+
+export function duplicateDrawing(name: string): void {
+    const source = drawingStore.getDrawing(name);
+    if (!source) {
+        pushToast('error', `Drawing '${name}' does not exist.`);
+        return;
+    }
+    const input = prompt('Enter a name for the duplicate drawing:', `${name} copy`);
+    if (!input || !input.trim()) return;
+    const newName = input.trim();
+    if (drawingStore.getDrawing(newName)) {
+        pushToast('error', `A drawing named '${newName}' already exists.`);
+        return;
+    }
+    try {
+        const copy = DrawingStore.cloneDrawing(source.drawing, sortStore);
+        source.drawing.forgetSvgRefs();
+        drawingStore.addDrawing(newName, copy);
+        drawing = copy;
+        ui.activeDrawingName = newName;
+        resetInteractionState();
+        pushToast('info', `Duplicated drawing as '${newName}'.`);
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function newDrawing(): void {
+    const input = prompt('Enter a name for the new drawing:');
+    if (!input || !input.trim()) return;
+    const name = input.trim();
+    if (drawingStore.getDrawing(name)) {
+        pushToast('error', `A drawing named '${name}' already exists.`);
+        return;
+    }
+    const fresh = new Drawing(sortStore);
+    try {
+        drawingStore.addDrawing(name, fresh);
+        drawing.forgetSvgRefs();
+        drawing = fresh;
+        ui.activeDrawingName = name;
+        resetInteractionState();
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export async function importDrawingsFile(file: File): Promise<void> {
+    const text = await file.text();
+    try {
+        const { names, renames } = drawingStore.importDrawingsJSON(text, sortStore);
+        let summary = `Imported ${names.length} drawing(s): ${names.map(n => `'${n}'`).join(', ')}.`;
+        if (renames.length > 0) {
+            summary += `\nRenamed on collision: ${renames.map(r => `'${r.requested}' -> '${r.actual}'`).join(', ')}.`;
+        }
+        pushToast('info', summary);
+
+    } catch (err) {
+        pushToast('error', `Error importing drawing:\n${(err as Error).message}`);
+    }
+}
+
+export function deleteSelectedDrawings(names: string[]): void {
+    if (names.length === 0) {
+        pushToast('error', 'Select at least one drawing to delete.');
+        return;
+    }
+    if (!confirm(`Are you sure you want to delete ${names.length} drawing(s): ${names.map(n => `'${n}'`).join(', ')}?`)) {
+        return;
+    }
+    const deleted = new Set(names);
+    for (const name of names) {
+        if (name === ui.activeDrawingName) {
+            drawing.forgetSvgRefs();
+            drawing = new Drawing(sortStore);
+            ui.activeDrawingName = null;
+            resetInteractionState();
+        }
+        drawingStore.deleteDrawing(name);
+    }
+    for (const name of deleted) {
+        ui.exportSelection.delete(name);
+    }
+
+}
+
+export function renameDrawingName(oldName: string, newName: string): void {
+    try {
+        drawingStore.renameDrawing(oldName, newName);
+        if (oldName === ui.activeDrawingName) {
+            ui.activeDrawingName = newName;
+        }
+        if (ui.exportSelection.has(oldName)) {
+            ui.exportSelection.delete(oldName);
+            ui.exportSelection.add(newName);
+        }
+
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function markDrawingAsRule(name: string, isRule: boolean): void {
+    try {
+        drawingStore.markAsRule(name, isRule);
+
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function toggleProofRecording(): void {
+    try {
+        const recorder = activeRecorder();
+        if (recorder.isActive()) {
+            const mainName = recorder.getRecordedDrawingName();
+            const snapshot = recorder.takeSnapshot();
+            const usedRuleNames = recorder.getUsedRuleNames();
+            const rocqScript = rocqRecorder.isActive() ? rocqRecorder.stop() : null;
+            ui.recordingActive = false;
+
+            const entry = mainName ? drawingStore.getDrawing(mainName) : undefined;
+            // The recording is tied to the drawing's first-order shape, which can
+            // have changed mid-recording (a layer added or removed); the live
+            // drawing, not the start-of-recording snapshot, decides this.
+            const splittable = !!entry && snapshot !== null && getFirstOrderStatementChildLayer(entry.drawing) !== null;
+            if (!splittable) {
+                // Recording only starts on a first-order statement, so reaching
+                // here means the drawing stopped being one mid-recording. The
+                // recording is discarded rather than offered anywhere.
+                pushToast('error', 'Proof Recording Error:\nThe recorded drawing is no longer a first-order statement; the recording was discarded.');
+                return;
+            }
+
+            try {
+                const { proofName } = splitFirstOrderRecording(mainName!, snapshot!, rocqScript);
+                pushToast('info', `Proof recording saved: '${mainName}' is now a rule carrying its proof; the proof-working drawing is '${proofName}'.`);
+                // Open the proof export window with the recorded proof checked
+                // together with every rule it used, so the exported code is
+                // self-contained. Used rules come first: the recorded proof
+                // references their parameters, which Rocq requires to be declared
+                // before use.
+                const exportNames: string[] = [];
+                for (const name of usedRuleNames) {
+                    if (name !== mainName && !exportNames.includes(name) && drawingStore.getDrawing(name)) {
+                        exportNames.push(name);
+                    }
+                }
+                exportNames.push(mainName!);
+                ui.exportSelection = new SvelteSet(exportNames);
+                openCodeExport(exportNames);
+            } catch (err) {
+                pushToast('error', `Proof Recording Error:\n${(err as Error).message}`);
+            }
+        } else {
+            if (getFirstOrderStatementChildLayer(drawing) === null) {
+                pushToast('error', 'Cannot start proof recording: the drawing is not a first-order statement (expected exactly one root layer and one child layer).');
+                return;
+            }
+            const name = ui.activeDrawingName ?? 'Unsaved Drawing';
+            rocqRecorder.start(drawing, name, sortStore);
+            ui.recordingActive = true;
+            // Open the Applicable Rules panel so the rules available for the
+            // proof are visible right away.
+            ui.rulesPanelCollapsed = false;
+        }
+
+    } catch (err) {
+        pushToast('error', `Proof Recording Error:\n${(err as Error).message}`);
+    }
+}
+
+export function toggleExportSelection(name: string): void {
+    if (ui.exportSelection.has(name)) {
+        ui.exportSelection.delete(name);
+    } else {
+        ui.exportSelection.add(name);
+    }
+}
+
+export function setExportSelectionAll(checked: boolean): void {
+    ui.exportSelection = checked ? new SvelteSet(drawingStore.getAllNames()) : new SvelteSet();
+}
+
+export async function loadSortScript(file: File): Promise<void> {
+    const code = await file.text();
+    try {
+        sortStore.clear();
+        drawing.clear();
+        resetInteractionState();
+        const executor = new Function('sortStore', 'd3', code);
+        executor(sortStore, d3);
+
+    } catch (err) {
+        pushToast('error', `Error executing sort script:\n${(err as Error).message}`);
+        console.error('Script Execution Error:', err);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layer helpers
+// ---------------------------------------------------------------------------
+
+export function addRootLayer(): void {
+    const name = prompt('Enter name for new root layer:', 'New Root Layer');
+    if (name && name.trim()) {
+        const id = `layer-${Date.now().toString(36)}`;
+        drawing.addLayer(id, name.trim(), null, '#9b59b6', true);
+
+    }
+}
+
+export function addChildLayer(layer: { id: string; name: string }): void {
+    const childName = prompt(`Enter name for child layer above '${layer.name}':`, `Child of ${layer.name}`);
+    if (childName && childName.trim()) {
+        const childId = `layer-${Date.now().toString(36)}`;
+        const randomColor = `#${Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0')}`;
+        drawing.addLayer(childId, childName.trim(), layer.id, randomColor, true);
+
+    }
+}
+
+export function renameLayer(layer: { id: string; name: string }): void {
+    const newName = prompt(`Enter new name for layer '${layer.name}':`, layer.name);
+    if (newName && newName.trim() && newName.trim() !== layer.name) {
+        layer.name = newName.trim();
+
+    }
+}
+
+export function deleteLayer(layer: { id: string; name: string }): void {
+    const descendants = drawing.getDescendants(layer.id);
+    const msg = descendants.size > 1
+        ? `Delete '${layer.name}' and its ${descendants.size - 1} child layer(s)? All associated artefacts will be removed!`
+        : `Delete layer '${layer.name}'?`;
+    if (confirm(msg)) {
+        drawing.removeLayer(layer.id);
+        if (ui.focusedLayerId && descendants.has(ui.focusedLayerId!)) {
+            ui.focusedLayerId = null;
+        }
+
+    }
+}
+
+export function duplicateLayer(layer: { id: string; name: string }): void {
+    const descendants = drawing.getDescendants(layer.id);
+    const artefactCount = drawing.getArtefacts().filter(art => descendants.has(art.layerId)).length;
+    const scope = descendants.size > 1
+        ? `${descendants.size - 1} child layer(s) and ${artefactCount} artefact(s)`
+        : `${artefactCount} artefact(s)`;
+    const newName = prompt(
+        `Enter name for the copy of '${layer.name}' (its ${scope} are copied too):`,
+        `${layer.name} (copy)`
+    );
+    if (!newName || !newName.trim()) return;
+    try {
+        drawing.duplicateLayerSubtree(layer.id, newName.trim());
+    } catch (err) {
+        pushToast('error', (err as Error).message);
+    }
+}
+
+export function toggleLayerVisibility(layer: { id: string; visible: boolean }): void {
+    layer.visible = !layer.visible;
+
+}
+
+export function toggleLayerFocus(layerId: string): void {
+    const current = ui.focusedLayerId;
+    if (current === layerId) {
+        ui.focusedLayerId = null;
+        drawing.setFocusedLayer(null);
+    } else {
+        ui.focusedLayerId = layerId;
+        drawing.setFocusedLayer(layerId);
+    }
+
+}
+
+export function setLayerColor(layer: { id: string; color: string; colorEnabled: boolean }, color: string): void {
+    layer.color = color;
+    layer.colorEnabled = true;
+
+}
+
+export function toggleLayerColorEnabled(layer: { id: string; colorEnabled: boolean }, checked: boolean): void {
+    layer.colorEnabled = checked;
+
+}
+
+export function syncProvedStatus(): void {
+    try {
+        const solvedDrawing = drawing;
+        const child = getFirstOrderStatementChildLayer(drawing);
+        let proved = false;
+        if (child) {
+            const result = drawing.checkLayerProvable(child.id);
+            proved = result.provable;
+            if (proved) {
+                const activeName = ui.activeDrawingName ?? 'Unsaved Drawing';
+                recordProve(child.id, result.match ?? null, activeName);
+            }
+        }
+        // Recording may have loaded another subgoal, which synced its own status
+        // on load. The flag belongs to the drawing we just examined, so stop once
+        // the active drawing is no longer that one.
+        if (getDrawing() !== solvedDrawing) {
+            return;
+        }
+        const name = ui.activeDrawingName;
+        if (name) {
+            drawingStore.setDrawingProved(name, proved);
+        }
+    } catch (err) {
+        pushToast('error', `Proved status check failed:\n${(err as Error).message}`);
+    }
+}
+
+// Re-entrancy guard for the solve -> load-next-subgoal walk below. Loading a
+// subgoal runs syncProvedStatus, which can close that subgoal's proof and
+// re-enter here; the walk below owns the chain instead.
+let advancingSubgoals = false;
+
+// A goal of the recorded drawing tree was just solved. The next subgoal still
+// awaiting a proof is loaded straight away; once none are left the recording is
+// terminated, which attaches the script to the drawing and opens the proof
+// modal.
+function advanceAfterSolve(solvedName: string): void {
+    advancingSubgoals = true;
+    try {
+        for (;;) {
+            const recorder = activeRecorder();
+            const next = recorder.nextPendingSubgoal();
+            if (!next) {
+                pushToast('info', `'${solvedName}' is solved and no subgoal is pending: stopping proof recording.`);
+                toggleProofRecording();
+                return;
+            }
+            if (!setActiveDrawing(next.drawingName)) {
+                return;
+            }
+            pushToast('info', `'${solvedName}' is solved. Loaded the next subgoal: '${next.drawingName}'.`);
+            solvedName = next.drawingName;
+            // setActiveDrawing syncs the proved status, so a subgoal that is
+            // already provable is discharged on load; keep walking in that case
+            // so the chain cannot dead-end on an already-solved subgoal.
+            if (recorder.statementInfo(next.drawingName)?.proved !== true) {
+                return;
+            }
+        }
+    } finally {
+        advancingSubgoals = false;
+    }
+}
+
+// Records a successful proof of `layerId` and reacts to it when this call is the
+// one that closed the proof. Re-proving an already-solved goal records nothing
+// and advances nothing, so the subgoal queue is never skipped.
+function recordProve(layerId: string, match: Map<Artefact, Artefact> | null, hostActiveName: string): void {
+    let closed = false;
+    runRecorderStep(recorder => {
+        closed = recorder.recordProveSuccess(drawing, layerId, match, hostActiveName) || closed;
+    });
+    if (!closed || advancingSubgoals) {
+        return;
+    }
+    const recorder = activeRecorder();
+    if (!ui.recordingActive || !recorder.isActive()) {
+        return;
+    }
+    // Only goals that belong to this recording navigate; proving an unrelated
+    // drawing is a no-op.
+    if (!recorder.statementInfo(hostActiveName)) {
+        return;
+    }
+    advanceAfterSolve(hostActiveName);
+}
+
+export function toggleFilterRedundantMatches(): void {
+    ui.filterRedundantMatches = !ui.filterRedundantMatches;
+}
+
+export function toggleFilterNoProgressMatches(): void {
+    ui.filterNoProgressMatches = !ui.filterNoProgressMatches;
+}
+
+export function toggleFilterInjectiveMatches(): void {
+    ui.filterInjectiveMatches = !ui.filterInjectiveMatches;
+}
+
+export function toggleFilterFlexibleMatches(): void {
+    ui.filterFlexibleMatches = !ui.filterFlexibleMatches;
+}
+
+export function toggleFilterSolvesGoalMatches(): void {
+    ui.filterSolvesGoalMatches = !ui.filterSolvesGoalMatches;
+}
+
+export function toggleAutoApplyEqualityRules(): void {
+    ui.autoApplyEqualityRules = !ui.autoApplyEqualityRules;
+    if (ui.autoApplyEqualityRules) {
+        runEqualityRuleAutoApply();
+    }
+}
+
+export function solvesGoalFilterApplicable(): boolean {
+    return getFirstOrderStatementChildLayer(drawing) !== null;
+}
+
+// ---------------------------------------------------------------------------
+// Applicable rules (computed reactively by RuleApplications.svelte)
+// ---------------------------------------------------------------------------
+
+export interface RuleAppEntry {
+    name: string;
+    drawing: Drawing;
+    isFirstOrder: boolean;
+    isEqualityRule: boolean;
+    applications: RuleApplication[];
+    hiddenRedundant: number;
+    hiddenNoProgress: number;
+    hiddenSolvesGoal: number;
+}
+
+/**
+ * Matching options default to the panel's 'Injective match' / 'Flexible match'
+ * checkboxes. The auto-apply pass passes its own options instead (see
+ * `AUTO_APPLY_MATCH_OPTIONS`).
+ */
+export function computeRuleMatches(matchOptions?: MatchOptions): RuleAppEntry[] {
+    // Tracked structural guard: the matcher below runs under `untrack`, so this
+    // derived still invalidates when the host drawing changes. We deliberately
+    // read each artefact's reactive fields (membership, sort, layer, dependency
+    // record) and the layer set so that any structural edit re-runs the search.
+    const hostGuard = drawing.getArtefacts().map(a => {
+        void a.sortName;
+        void a.layerId;
+        void a.dependencies;
+        return a;
+    });
+    void hostGuard;
+    void drawing.getAllLayers();
+
+    const options: MatchOptions = matchOptions ?? {
+        injective: ui.filterInjectiveMatches,
+        flexible: ui.filterFlexibleMatches
+    };
+    const entries: RuleAppEntry[] = [];
+    for (const entry of drawingStore.getAllDrawings()) {
+        const ruleDrawing = entry.drawing;
+        if (!ruleDrawing.isRule) continue;
+        let applications: RuleApplication[];
+        const isFirstOrder = drawingStore.checkIsFirstOrder(ruleDrawing);
+        try {
+            applications = untrack(() => isFirstOrder
+                ? findFirstOrderRuleApplications(ruleDrawing, drawing, options)
+                : findSecondOrderRuleApplications(ruleDrawing, drawing, options));
+        } catch {
+            continue;
+        }
+
+        entries.push({ name: entry.name, drawing: ruleDrawing, isFirstOrder, isEqualityRule: isFirstOrder && isEqualityRule(ruleDrawing), applications, hiddenRedundant: 0, hiddenNoProgress: 0, hiddenSolvesGoal: 0 });
+    }
+    return entries;
+}
+
+export function applyRuleFilters(entries: RuleAppEntry[]): RuleAppEntry[] {
+    return entries.map(entry => {
+        const { name, drawing: ruleDrawing } = entry;
+        let applications = entry.applications;
+
+        let hiddenRedundant = 0;
+        if (ui.filterRedundantMatches && applications.length > 1) {
+            const total = applications.length;
+            applications = untrack(() => filterRedundantRuleApplications(ruleDrawing, drawing, applications));
+            hiddenRedundant = total - applications.length;
+        }
+
+        let hiddenNoProgress = 0;
+        if (ui.filterNoProgressMatches && applications.length > 0) {
+            const total = applications.length;
+            applications = untrack(() => filterNoProgressRuleApplications(ruleDrawing, drawing, applications));
+            hiddenNoProgress = total - applications.length;
+        }
+
+        let hiddenSolvesGoal = 0;
+        if (ui.filterSolvesGoalMatches && applications.length > 0) {
+            const total = applications.length;
+            applications = untrack(() => filterSolvesGoalRuleApplications(ruleDrawing, drawing, applications));
+            hiddenSolvesGoal = total - applications.length;
+        }
+
+        return { name, drawing: ruleDrawing, isFirstOrder: entry.isFirstOrder, isEqualityRule: entry.isEqualityRule, applications, hiddenRedundant, hiddenNoProgress, hiddenSolvesGoal };
+    });
+}
+
+export function computeRuleApplications(): RuleAppEntry[] {
+    return applyRuleFilters(computeRuleMatches());
+}
+
+// ---------------------------------------------------------------------------
+// Auto-applying equality rules
+// ---------------------------------------------------------------------------
+
+// Re-entrancy guard: the pass below drives the application code, which triggers
+// the pass again on success. Without the guard every nested application would
+// start its own pass over the host.
+let equalityAutoApplyRunning = false;
+
+// Auto-apply matches equality rules as if 'Filter no-progress matches' and
+// 'Flexible match' were on and 'Injective match' were off, whatever the panel
+// shows: an equality rule only ever asserts equalities, so every match that is
+// not already provable is worth applying, and matching up to provable equality
+// without injectivity collapses the applications that would assert the very
+// same thing. Dropping injectivity can only make an application degenerate (two
+// children of the asserted equality collapse onto one host artefact), and such
+// an application asserts nothing new, so the no-progress filter below removes it
+// before it is applied.
+const AUTO_APPLY_MATCH_OPTIONS: MatchOptions = { injective: false, flexible: true };
+
+/**
+ * Applies the first equality rule that still has an application which asserts
+ * something new, and returns the name of the rule that was applied, or null if
+ * no equality rule applies anymore (or the application failed and left the host
+ * unchanged, in which case the very same application would be selected again).
+ */
+function applyNextEqualityRule(): string | null {
+    // Raw matches: the redundant and solves-the-goal filters are panel settings
+    // and do not restrict what auto-apply does. The no-progress filter is applied
+    // here below regardless of its checkbox, since an application that asserts
+    // nothing new would otherwise be selected again on every iteration and the
+    // pass would never reach a fixpoint.
+    for (const entry of computeRuleMatches(AUTO_APPLY_MATCH_OPTIONS)) {
+        if (!entry.isEqualityRule) continue;
+        const next = untrack(() => filterNoProgressRuleApplications(entry.drawing, drawing, entry.applications))
+            .find(app => app.matchedArtefacts.size > 0);
+        if (!next) continue;
+
+        // A failed application leaves the host untouched, so the very same
+        // application would be selected again; stop instead of looping. Note that
+        // a successful application may add no artefact at all, when it merges
+        // into an existing equality, so success cannot be read off the host.
+        return applyRuleEntry(entry, next) ? entry.name : null;
+    }
+    return null;
+}
+
+/**
+ * Summarises a pass: one line per rule, in the order the rules were first
+ * applied, with a count for the rules applied more than once.
+ */
+function formatEqualityAutoApplyToast(appliedNames: string[]): string {
+    const counts = new Map<string, number>();
+    for (const name of appliedNames) counts.set(name, (counts.get(name) ?? 0) + 1);
+    const total = appliedNames.length;
+    const header = total === 1
+        ? 'Auto-applied 1 equality rule application:'
+        : `Auto-applied ${total} equality rule applications:`;
+    const lines = [...counts].map(([name, count]) => `- ${name}${count > 1 ? ` (×${count})` : ''}`);
+    return `${header}\n${lines.join('\n')}`;
+}
+
+/**
+ * Applies equality rules (see `isEqualityRule`) until none of them makes
+ * progress anymore, matching them with `AUTO_APPLY_MATCH_OPTIONS`. Each
+ * iteration asserts an equality that is not already provable in the host, so
+ * every step merges two equality classes and the pass reaches a fixpoint after
+ * finitely many steps. Each pass ends with a single toast summarising what it
+ * applied.
+ */
+export function runEqualityRuleAutoApply(): void {
+    if (!ui.autoApplyEqualityRules || equalityAutoApplyRunning) return;
+    equalityAutoApplyRunning = true;
+    const appliedNames: string[] = [];
+    try {
+        for (;;) {
+            const name = applyNextEqualityRule();
+            if (!name) break;
+            appliedNames.push(name);
+        }
+    } finally {
+        equalityAutoApplyRunning = false;
+    }
+    // Only the outermost pass reports: while the guard is set, the pass that
+    // applyRuleEntry triggers on every application is a no-op.
+    if (appliedNames.length > 0) {
+        pushToast('info', formatEqualityAutoApplyToast(appliedNames));
+    }
+}
+
+export function applyRuleAt(savedRuleName: string, appIndex: number): void {
+    ui.ruleHoverArtefacts = null;
+    const entry = computeRuleApplications().find(e => e.name === savedRuleName);
+    const app = entry?.applications[appIndex];
+    if (!entry || !app) return;
+    applyRuleEntry(entry, app);
+}
+
+/**
+ * Applies one rule application, records it, and re-runs the auto-apply pass.
+ * Callers pass the application itself, so that the pass can apply a match the
+ * panel is not showing without going through panel indices. Reports whether the
+ * rule was actually applied: an application that only merges into an existing
+ * equality does not add an artefact, so the host's artefact count cannot be
+ * used to tell success from failure.
+ */
+function applyRuleEntry(entry: RuleAppEntry, app: RuleApplication): boolean {
+    ui.ruleHoverArtefacts = null;
+    const { name, drawing: ruleDrawing } = entry;
+    const activeName = ui.activeDrawingName ?? 'Unsaved Drawing';
+    const goalWasProved = computeProved(drawing);
+    let applicationResult: { artefacts: Artefact[]; created: Map<Artefact, Artefact>; derivedNames?: string[]; derived?: DerivedRule[] } | null = null;
+    let applied = false;
+    try {
+        if (entry.isFirstOrder) {
+            const result = applyFirstOrderRule(ruleDrawing, drawing, app);
+            applicationResult = result;
+            applied = true;
+            console.log(`Applied '${name}': added ${result.artefacts.length} artefact(s).`);
+        } else {
+            const result = applySecondOrderRule(ruleDrawing, drawing, app, { hostName: activeName, ruleName: name });
+            applicationResult = { artefacts: result.hostArtefacts, created: result.hostCreated, derived: result.derivedRules };
+            applied = true;
+            console.log(`Applied '${name}': added ${result.hostArtefacts.length} artefact(s), derived ${result.derivedRules.length} drawing(s).`);
+            const createdNames: string[] = [];
+            for (const derived of result.derivedRules) {
+                let derivedName = derived.name;
+                let suffix = 2;
+                while (drawingStore.getDrawing(derivedName)) {
+                    derivedName = `${derived.name} (${suffix})`;
+                    suffix++;
+                }
+                drawingStore.addDrawing(derivedName, derived.drawing);
+                drawingStore.setDrawingParent(derivedName, activeName);
+                createdNames.push(derivedName);
+                console.log(`Saved derived drawing '${derivedName}': isRule=${derived.drawing.isRule}, artefacts=${derived.drawing.getArtefacts().length}.`);
+            }
+            applicationResult.derivedNames = createdNames;
+            pushToast('info', `Applied rule '${name}': added ${result.hostArtefacts.length} artefact(s) and created ${createdNames.length} derived drawing(s):\n- ${createdNames.join('\n- ')}`);
+        }
+        if (applicationResult) {
+            const result = applicationResult;
+            runRecorderStep(recorder => {
+                recorder.recordRuleApply(ruleDrawing, name, app, drawing, result, activeName, sortStore);
+            });
+        }
+        syncProvedStatus();
+        if (!goalWasProved && computeProved(drawing)) {
+            pushToast('success', 'Goal solved');
+        }
+
+    } catch (err) {
+        pushToast('error', `Error applying rule '${name}':\n${(err as Error).message}`);
+    }
+    if (applied) {
+        runEqualityRuleAutoApply();
+    }
+    return applied;
+}
+
+export function generateReverseRulesFor(savedRuleName: string): void {
+    const entry = drawingStore.getDrawing(savedRuleName);
+    if (!entry) {
+        pushToast('error', `Drawing '${savedRuleName}' does not exist.`);
+        return;
+    }
+    if (!entry.drawing.isRule || drawingStore.checkIsFirstOrder(entry.drawing)) {
+        pushToast('error', `Drawing '${savedRuleName}' is not a second-order rule.`);
+        return;
+    }
+    try {
+        const results = generateFirstOrderReverseRules(entry.drawing);
+        if (results.length === 0) {
+            pushToast('info', `Second-order rule '${savedRuleName}' has no premise layers; nothing generated.`);
+            return;
+        }
+        const createdNames: string[] = [];
+        for (const result of results) {
+            let name = `${savedRuleName} > ${result.premiseName} (reverse)`;
+            let suffix = 2;
+            while (drawingStore.getDrawing(name)) {
+                name = `${savedRuleName} > ${result.premiseName} (reverse) (${suffix})`;
+                suffix++;
+            }
+            drawingStore.addDrawing(name, result.drawing);
+            drawingStore.setDrawingParent(name, savedRuleName);
+            createdNames.push(name);
+            console.log(`Generated reverse rule '${name}': isRule=${result.drawing.isRule}, artefacts=${result.drawing.getArtefacts().length}.`);
+        }
+        pushToast('info', `Generated ${createdNames.length} reverse rule(s) for '${savedRuleName}':\n- ${createdNames.join('\n- ')}`);
+
+    } catch (err) {
+        pushToast('error', `Error generating reverse rules for '${savedRuleName}':\n${(err as Error).message}`);
+    }
+}

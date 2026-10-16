@@ -1,0 +1,1284 @@
+import { describe, it, expect } from 'vitest';
+import { exportDrawingsToRocq, ruleParamBaseName, ruleTypeInfo, newExportRegistry, orderLayerElements } from '../rocq_export';
+import type { LayerElement } from '../rocq_export';
+import { RocqRecorder } from '../rocq_recording.svelte.ts';
+import { Drawing, DrawingStore, findFirstOrderRuleApplications, applyFirstOrderRule, findSecondOrderRuleApplications, applySecondOrderRule, filterNoProgressRuleApplications, getFirstOrderStatementChildLayer } from '../index.svelte.ts';
+import { newSortStore, makeVertex, makeEdge, makeDrawing, buildComposableHost, buildIsMonoInChildLayerRule, buildIsMonoOnlyConclusionRule, buildSecondOrderRule } from './helpers';
+
+describe('rocq export', () => {
+    it('exports sorts and a sigma notation preamble without records or modules', () => {
+        const sortStore = newSortStore();
+        const drawing = new Drawing(sortStore);
+        const v0 = makeVertex(drawing, 'a');
+        const v1 = makeVertex(drawing, 'b');
+        makeEdge(drawing, 'f', v0, v1);
+
+        const store = new DrawingStore();
+        store.addDrawing('MainDrawing', drawing);
+
+        const code = exportDrawingsToRocq(store.getAllDrawings(), sortStore);
+        expect(code.startsWith('Require Import Ltac2.Ltac2.')).toBe(true);
+        expect(code).toContain('Definition Sigma');
+        expect(code).not.toContain('(sigT (fun x => ..');
+        expect(code).toContain('Parameter Vertex : Type.');
+        expect(code).toContain('Parameter Edge : Vertex -> Vertex -> Type.');
+        expect(code).not.toContain('Module MainDrawing');
+        expect(code).not.toContain('Record');
+    });
+
+    it('records a rule application against a host and emits a goal', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ma = makeVertex(host, 'a');
+        const mb = makeVertex(host, 'b');
+        makeEdge(host, 'g', ma, mb);
+        host.newEqualityArtefact([ma, mb], 'root');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.newArtefact('Edge', { source: rx, target: ry }, { width: 2, bend: 0, label: 'f' }, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('Foo', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findFirstOrderRuleApplications(rule, host, { flexible: true });
+        expect(apps.length).toBe(1);
+        const created = applyFirstOrderRule(rule, host, apps[0]);
+        recorder.recordRuleApply(rule, 'Foo', apps[0], host, created, 'MainDrawing', sortStore);
+        recorder.recordProveSuccess(host, null, null, 'MainDrawing');
+        const script = recorder.stop();
+
+        expect(script).toContain('Lemma MainDrawing_rule :');
+        expect(script).toContain('intros');
+        expect(script).toContain('@Foo_rule a b');
+        expect(script).toContain('as f');
+        expect(script).toContain('forall (a b : Vertex)');
+        expect(script).toContain('Qed');
+
+        const code = exportDrawingsToRocq(store.getAllDrawings(), sortStore) + '\n' + script;
+        expect(code).toContain('Parameter Foo_rule :');
+        expect(code).toContain('forall');
+        expect(code).not.toContain('Module MainDrawing');
+        expect(code).not.toContain('Module Foo');
+    });
+
+    it('starts the proof with intros only when the root layer has no equality', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        makeVertex(host, 'a');
+        makeVertex(host, 'b');
+        store.addDrawing('MainDrawing', host);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        expect(script).toContain('Lemma MainDrawing_rule :');
+    });
+
+    it('applies a rule whose multi-element conclusion combines an artefact and an equality', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ma = makeVertex(host, 'a');
+        const mb = makeVertex(host, 'b');
+        makeEdge(host, 'g', ma, mb);
+        host.newEqualityArtefact([ma, mb], 'root');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.newArtefact('Edge', { source: rx, target: ry }, { width: 2, bend: 0, label: 'f' }, 'conclusion');
+        rule.newEqualityArtefact([rx, ry], 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('FooEq', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findFirstOrderRuleApplications(rule, host, { flexible: true });
+        expect(apps.length).toBe(1);
+        const created = applyFirstOrderRule(rule, host, apps[0]);
+        recorder.recordRuleApply(rule, 'FooEq', apps[0], host, created, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        expect(script).toContain('@FooEq_rule a b');
+    });
+
+    it('applies a rule whose conclusion is a single equality', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        makeVertex(host, 'a');
+        makeVertex(host, 'b');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.newEqualityArtefact([rx, ry], 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('EqConclusionRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findFirstOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const created = applyFirstOrderRule(rule, host, apps[0]);
+        recorder.recordRuleApply(rule, 'EqConclusionRule', apps[0], host, created, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        expect(script).toContain('@EqConclusionRule_rule a b');
+        // A conclusion equality is masked as `_`: `destruct_sigma` runs
+        // `subst_all ()` after the destruct, so the name would never survive as
+        // a hypothesis anyway.
+        expect(script).toContain('destruct_sigma (@EqConclusionRule_rule a b) as _.');
+        expect(script).not.toContain('as eq_a_b');
+    });
+
+    it('applies a second-order rule with a single non-equality conclusion', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        makeVertex(host, 'a');
+        makeVertex(host, 'b');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('premise-1', 'Premise', 'root');
+        makeEdge(rule, 'pe', rx, ry, 'premise-1');
+        rule.addLayer('premise-1-child', 'Premise Child', 'premise-1');
+        makeEdge(rule, 'pce', rx, ry, 'premise-1-child');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'ce', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('SecondOrderRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findSecondOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const result = applySecondOrderRule(rule, host, apps[0], { hostName: 'MainDrawing', ruleName: 'SecondOrderRule' });
+        recorder.recordRuleApply(rule, 'SecondOrderRule', apps[0], host, { artefacts: result.hostArtefacts, created: result.hostCreated, derived: result.derivedRules }, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        expect(script).not.toContain('Lemma MainDrawing___SecondOrderRule___Premise_rule :');
+        expect(script).toContain('Admitted.');
+        expect(script).toContain('assert (Hpremise1 : forall (pe : Edge a b), Edge a b). {');
+        expect(script).toContain('@SecondOrderRule_rule a b Hpremise1');
+        expect(script).toContain('as ce');
+        expect(script).toContain('admit.');
+
+        // The unfinished subgoal's partial proof is inlined between the braces.
+        const inlineStart = script.indexOf('assert (Hpremise1 : forall (pe : Edge a b), Edge a b). {');
+        const inlineEnd = script.indexOf('}', inlineStart);
+        expect(inlineStart).toBeGreaterThan(-1);
+        expect(inlineEnd).toBeGreaterThan(-1);
+        expect(script.slice(inlineStart, inlineEnd)).toContain('intros_sigma ().');
+    });
+
+    it('keeps recorded steps of an unfinished subgoal proof inlined before the enclosing admit', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        makeVertex(host, 'a');
+        makeVertex(host, 'b');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('premise-1', 'Premise', 'root');
+        makeEdge(rule, 'pe', rx, ry, 'premise-1');
+        rule.addLayer('premise-1-child', 'Premise Child', 'premise-1');
+        makeEdge(rule, 'pce', rx, ry, 'premise-1-child');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'ce', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('SecondOrderRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findSecondOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const result = applySecondOrderRule(rule, host, apps[0], { hostName: 'MainDrawing', ruleName: 'SecondOrderRule' });
+        const sub = result.derivedRules[0];
+        recorder.recordRuleApply(
+            rule,
+            'SecondOrderRule',
+            apps[0],
+            host,
+            { artefacts: result.hostArtefacts, created: result.hostCreated, derived: result.derivedRules },
+            'MainDrawing',
+            sortStore
+        );
+
+        // The subgoal is partly worked (a rename) but never proved.
+        recorder.recordRename('pe', 'pf', sub.name);
+        const script = recorder.stop();
+
+        expect(script).not.toContain('Lemma MainDrawing___SecondOrderRule___Premise_rule :');
+        const inlineStart = script.indexOf('assert (Hpremise1 : forall (pe : Edge a b), Edge a b). {');
+        const inlineEnd = script.indexOf('}', inlineStart);
+        expect(inlineStart).toBeGreaterThan(-1);
+        expect(inlineEnd).toBeGreaterThan(-1);
+        expect(script.slice(inlineStart, inlineEnd)).toContain('rename pe into pf.');
+        expect(script.slice(inlineStart, inlineEnd)).toContain('admit.');
+    });
+
+    it('inlines the subgoal proof against the mapped premise type, leaving host context enclosing', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ha = makeVertex(host, 'a');
+        const hb = makeVertex(host, 'b');
+        makeVertex(host, 'c');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('premise-1', 'Premise', 'root');
+        makeEdge(rule, 'pe', rx, ry, 'premise-1');
+        rule.addLayer('premise-1-child', 'Premise Child', 'premise-1');
+        makeEdge(rule, 'pce', rx, ry, 'premise-1-child');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'ce', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('SecondOrderRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findSecondOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const app = apps.find(a => a.matchedArtefacts.get(rx) === ha && a.matchedArtefacts.get(ry) === hb) ?? apps[0];
+        const result = applySecondOrderRule(rule, host, app, { hostName: 'MainDrawing', ruleName: 'SecondOrderRule' });
+        const derived = result.derivedRules[0];
+        store.addDrawing(derived.name, derived.drawing);
+        recorder.recordRuleApply(
+            rule,
+            'SecondOrderRule',
+            app,
+            host,
+            { artefacts: result.hostArtefacts, created: result.hostCreated, derivedNames: result.derivedRules.map(d => d.name), derived: result.derivedRules },
+            'MainDrawing',
+            sortStore
+        );
+        const script = recorder.stop();
+
+        // The subgoal is asserted inline with the mapped premise type; the extra
+        // host vertex `c` stays in the enclosing lemma's context. No standalone
+        // subgoal lemma is emitted.
+        expect(script).not.toContain('Lemma MainDrawing___SecondOrderRule___Premise_rule : forall (a b c : Vertex)(pe : Edge a b), Edge a b.');
+        expect(script).toContain('assert (Hpremise1 : forall (pe : Edge a b), Edge a b). {');
+        expect(script).toContain('admit.');
+    });
+
+    it('orders rule arguments by sort group, each sort followed by its equalities', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ha = makeVertex(host, 'a');
+        const hb = makeVertex(host, 'b');
+        const hc = makeVertex(host, 'c');
+        host.newEqualityArtefact([ha, hb], 'root');
+        const hmw = host.newArtefact('Edge', { source: ha, target: hc }, { width: 2, bend: 0, label: 'mw' }, 'root');
+        host.newArtefact('isMono', { arrow: hmw }, {}, 'root');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        const rw = makeVertex(rule, 'w');
+        rule.newEqualityArtefact([rx, ry], 'root');
+        const rmw = rule.newArtefact('Edge', { source: rx, target: rw }, { width: 2, bend: 0, label: 'mw' }, 'root');
+        rule.newArtefact('isMono', { arrow: rmw }, {}, 'root');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.newArtefact('Edge', { source: rx, target: ry }, { width: 2, bend: 0, label: 'f' }, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('ArgOrderRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findFirstOrderRuleApplications(rule, host);
+        expect(apps.length).toBe(1);
+        const created = applyFirstOrderRule(rule, host, apps[0]);
+        recorder.recordRuleApply(rule, 'ArgOrderRule', apps[0], host, created, 'MainDrawing', sortStore);
+        recorder.recordProveSuccess(host, null, null, 'MainDrawing');
+        const script = recorder.stop();
+
+        expect(script).toContain('@ArgOrderRule_rule a b c eq_refl mw isMono_2');
+        expect(script).not.toContain('@ArgOrderRule_rule a b c mw isMono_2 eq_refl');
+    });
+
+    it('groups layer binders by sort declaration order regardless of drawing order', () => {
+        const sortStore = newSortStore();
+
+        const rule = new Drawing(sortStore);
+        const rv0 = makeVertex(rule, 'v0');
+        const rv1 = makeVertex(rule, 'v1');
+        const rv2 = makeVertex(rule, 'v2');
+        const re1 = makeEdge(rule, 'e1', rv0, rv1);
+        const re2 = makeEdge(rule, 'e2', rv1, rv2);
+        const re3 = makeEdge(rule, 'e3', rv2, rv0);
+        const re4 = makeEdge(rule, 'e4', rv0, rv2);
+        // A Pullback and a further Edge are created out of sort order, and the
+        // two equalities last of all: the grouping, not the drawing order,
+        // decides the binder sequence.
+        rule.newArtefact('Pullback', { p1: re1, p2: re2, q1: re3, q2: re4 }, { label: 'pb' }, 'root');
+        const re5 = makeEdge(rule, 'e5', rv1, rv0);
+        rule.newEqualityArtefact([rv0, rv1], 'root');
+        rule.newEqualityArtefact([re1, re5], 'root');
+
+        const info = ruleTypeInfo(rule, 'SortGroupRule', sortStore, newExportRegistry(sortStore), {
+            reserveParam: false,
+            includePremises: false
+        });
+
+        expect(info.rootElements.map(el => el.name)).toEqual([
+            'v0', 'v1', 'v2', 'eq_v0_v1',
+            'e1', 'e2', 'e3', 'e4', 'e5', 'eq_e1_e5',
+            'pb'
+        ]);
+        expect(info.type).toBe(
+            'forall (v0 v1 v2 : Vertex)(eq_v0_v1 : v0 = v1), ' +
+            'ltac:(subst_all_in (forall (e1 : Edge v0 v1)(e2 : Edge v1 v2)(e3 : Edge v2 v0)' +
+            '(e4 : Edge v0 v2)(e5 : Edge v1 v0)(eq_e1_e5 : e1 = e5), ' +
+            'ltac:(subst_all_in (forall (pb : Pullback e1 e2 e3 e4), True))))'
+        );
+    });
+
+    it('orders sorts for the binders by the same order it declares their Parameters', () => {
+        const sortStore = newSortStore();
+
+        expect(sortStore.getSortNames()).toEqual([
+            'Vertex', 'Edge', 'Pullback', 'Triangle', 'Square', 'isMono', 'isId', 'EqEdges'
+        ]);
+
+        const code = exportDrawingsToRocq([{ name: 'Plain', drawing: makeDrawing() }], sortStore);
+        const declared = code
+            .split('\n')
+            .filter(line => line.startsWith('Parameter '))
+            .map(line => line.slice('Parameter '.length).split(' ')[0]);
+        expect(declared).toEqual(sortStore.getSortNames());
+    });
+
+    // The exporters and the rule matcher both treat `getSortNames()` as a
+    // dependency-respecting order without running a topological sort, so this
+    // invariant is what makes that sound. It holds because `newSort` refuses a
+    // forward reference; the two tests pin both halves.
+    it('lists every sort after the sorts it depends on', () => {
+        const sortStore = newSortStore();
+        const rank = new Map(sortStore.getSortNames().map((name, i) => [name, i] as const));
+
+        const misordered: string[] = [];
+        for (const name of sortStore.getSortNames()) {
+            for (const depSortName of Object.values(sortStore.getSort(name)!.dependencies)) {
+                if ((rank.get(depSortName) ?? -1) >= rank.get(name)!) {
+                    misordered.push(
+                        `'${name}' is declared at ${rank.get(name)} but depends on '${depSortName}' at ${rank.get(depSortName)}`
+                    );
+                }
+            }
+        }
+
+        expect(misordered).toEqual([]);
+    });
+
+    it('refuses to declare a sort before a sort it depends on', () => {
+        const sortStore = newSortStore();
+        const noop = () => null;
+
+        // 'Ends' names 'Middle', which has not been declared yet.
+        expect(() => sortStore.newSort('Ends', { from: 'Middle' }, {}, noop)).toThrow(
+            /Dependency sort 'Middle'/
+        );
+        expect(sortStore.getSortNames()).not.toContain('Ends');
+
+        // Declared after its dependency, the same sort is accepted.
+        sortStore.newSort('Middle', {}, {}, noop);
+        sortStore.newSort('Ends', { from: 'Middle' }, {}, noop);
+        const names = sortStore.getSortNames();
+        expect(names).toContain('Middle');
+        expect(names.indexOf('Middle')).toBeLessThan(names.indexOf('Ends'));
+    });
+
+    it('rejects a sort order that would emit a dependency after its dependent', () => {
+        const vertex: LayerElement = { name: 'a', type: 'Vertex', kind: 'artefact', groupSort: 'Vertex', deps: [], artefactId: 'a1' };
+        const edge: LayerElement = { name: 'f', type: 'Edge a b', kind: 'artefact', groupSort: 'Edge', deps: ['a'], artefactId: 'a2' };
+
+        // A sorts file that declared Edge before Vertex: grouping follows it and
+        // would bind `f` at a type mentioning `a`, so the layering is rejected.
+        expect(() => orderLayerElements([vertex, edge], ['Edge', 'Vertex']))
+            .toThrow(/'f' depends on a, which is emitted later/);
+        expect(orderLayerElements([vertex, edge], ['Vertex', 'Edge'])).toEqual([vertex, edge]);
+    });
+
+    it('applies a first-order rule combining an artefact and a conclusion-layer isMono, naming it from the host', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = buildComposableHost().host;
+        store.addDrawing('MainDrawing', host);
+
+        const rule = buildIsMonoInChildLayerRule();
+        store.addDrawing('IsMonoInChildLayer', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findFirstOrderRuleApplications(rule, host);
+        expect(apps.length).toBe(1);
+        const created = applyFirstOrderRule(rule, host, apps[0]);
+        recorder.recordRuleApply(rule, 'IsMonoInChildLayer', apps[0], host, created, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        expect(script).toContain('@IsMonoInChildLayer_rule hv0 hv1 hv2 he1 he2');
+        expect(script).toContain('as fe3 isMono_2');
+        expect(script).not.toContain('as ()');
+    });
+
+    it('applies a second-order rule combining an artefact and a conclusion-layer isMono, naming it from the host', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = buildComposableHost().host;
+        store.addDrawing('MainDrawing', host);
+
+        const rule = buildSecondOrderRule();
+        store.addDrawing('SecondOrderRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findSecondOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const result = applySecondOrderRule(rule, host, apps[0], { hostName: 'MainDrawing', ruleName: 'SecondOrderRule' });
+        recorder.recordRuleApply(rule, 'SecondOrderRule', apps[0], host, { artefacts: result.hostArtefacts, created: result.hostCreated, derived: result.derivedRules }, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        expect(script).not.toContain('Lemma MainDrawing___SecondOrderRule___Premise_A_rule :');
+        expect(script).toContain('assert (Hpremise1 : ');
+        expect(script).toContain('admit.');
+        expect(script).toContain('@SecondOrderRule_rule hv0 hv1 hv2 he1 he2 Hpremise1');
+        expect(script).toContain('as sh isMono_2');
+        expect(script).not.toContain('as ()');
+    });
+
+    it('applies a rule whose conclusion is only an isMono already present in a host child layer', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = makeDrawing();
+        const hv0 = makeVertex(host, 'hv0');
+        const hv1 = makeVertex(host, 'hv1');
+        const hv2 = makeVertex(host, 'hv2');
+        makeEdge(host, 'he1', hv0, hv1);
+        host.addLayer('mono-layer', 'Mono Layer', 'root');
+        const he2 = host.newArtefact('Edge', { source: hv1, target: hv2 }, { width: 2, bend: 0, label: 'he2' }, 'root');
+        host.newArtefact('isMono', { arrow: he2 }, {}, 'mono-layer');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = buildIsMonoOnlyConclusionRule();
+        store.addDrawing('FlagOnlyRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findFirstOrderRuleApplications(rule, host);
+        expect(apps.length).toBe(1);
+        const created = applyFirstOrderRule(rule, host, apps[0]);
+        recorder.recordRuleApply(rule, 'FlagOnlyRule', apps[0], host, created, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        // The output isMono is a genuine goal layer (mono-layer) that was never
+        // proved, so the unfinished main is exported as Admitted rather than a
+        // bogus Qed, keeping the recorded partial proof.
+        expect(script).toContain('Lemma MainDrawing_rule :');
+        expect(script).toContain('forall (hv0 hv1 hv2 : Vertex)(he1 : Edge hv0 hv1)(he2 : Edge hv1 hv2), isMono he2');
+        expect(script).toContain('Admitted.');
+        expect(script).not.toContain('Qed.');
+        const mainStart = script.indexOf('Lemma MainDrawing_rule :');
+        const mainEnd = script.indexOf('Admitted.', mainStart);
+        expect(script.slice(mainStart, mainEnd)).toContain('destruct_sigma (@FlagOnlyRule_rule hv0 hv1 hv2 he1 he2) as isMono_3.');
+    });
+
+    it('places a root equality binder before the conclusion sorts in the rule type', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.newEqualityArtefact([rx, ry], 'root');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'f', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('WrappedEqRule', rule);
+
+        const code = exportDrawingsToRocq(store.getAllDrawings(), sortStore);
+        expect(code).toContain('Parameter WrappedEqRule_rule : forall (x y : Vertex)(eq_x_y : x = y),');
+        expect(code).toContain('Edge x y');
+    });
+
+    it('places a conclusion equality binder before the sigma body in the rule type', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.newEqualityArtefact([rx, ry], 'conclusion');
+        makeEdge(rule, 'f', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('SigmaEqRule', rule);
+
+        const code = exportDrawingsToRocq(store.getAllDrawings(), sortStore);
+        expect(code).toContain('Parameter SigmaEqRule_rule : forall (x y : Vertex), Σ (eq_x_y : x = y),');
+        expect(code).toContain('Edge x y');
+    });
+
+    // `destruct_sigma` runs `subst_all ()` right after each `destruct`, so an
+    // equality binder never survives as a named hypothesis: emit `_` instead of
+    // the host equality name.
+    // A vertex equality is emitted right after the vertex group, i.e. before
+    // the edge, so the edge is the sigma witness and the equality is the
+    // masked binder that precedes it.
+    it('masks a conclusion equality on an earlier sort before the witness in destruct_sigma', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ha = makeVertex(host, 'a');
+        const hb = makeVertex(host, 'b');
+        makeEdge(host, 'g', ha, hb);
+        host.newEqualityArtefact([ha, hb], 'root');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'f', rx, ry, 'conclusion');
+        rule.newEqualityArtefact([rx, ry], 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('TrailingEqRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findFirstOrderRuleApplications(rule, host, { flexible: true });
+        expect(apps.length).toBe(1);
+        const created = applyFirstOrderRule(rule, host, apps[0]);
+        recorder.recordRuleApply(rule, 'TrailingEqRule', apps[0], host, created, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        expect(script).toContain('destruct_sigma (@TrailingEqRule_rule a b) as _ f.');
+        expect(script).not.toContain('as f eq_');
+    });
+
+    it('masks a leading conclusion equality in the assert-then-destruct_sigma form', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        makeVertex(host, 'a');
+        makeVertex(host, 'b');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('premise-1', 'Premise', 'root');
+        makeEdge(rule, 'pe', rx, ry, 'premise-1');
+        rule.addLayer('premise-1-child', 'Premise Child', 'premise-1');
+        makeEdge(rule, 'pce', rx, ry, 'premise-1-child');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.newEqualityArtefact([rx, ry], 'conclusion');
+        makeEdge(rule, 'ce', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('EqFirstConclusion', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findSecondOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const result = applySecondOrderRule(rule, host, apps[0], { hostName: 'MainDrawing', ruleName: 'EqFirstConclusion' });
+        recorder.recordRuleApply(rule, 'EqFirstConclusion', apps[0], host, { artefacts: result.hostArtefacts, created: result.hostCreated, derived: result.derivedRules }, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        // Arity > 1 with premises: the term has an arrow type, so it is asserted
+        // under a real name first. The `as` list masks the equality, the trailing
+        // artefact keeps its host name.
+        expect(script).toMatch(/assert \(\w+ := @EqFirstConclusion_rule [^)]*\); destruct_sigma \w+ as _ ce\./);
+        expect(script).not.toContain('as eq_');
+    });
+
+    it('records a rule whose first conclusion equality collapsed onto one host artefact', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        // Two distinct host Triangles whose `1`/`2` deps are provably equal
+        // (mirrors bug4's a23/a24) and whose `o` edge is literally the same
+        // artefact, so a flexible match can send the two rule Triangles to the
+        // two host Triangles while `f` and `g` both land on that shared edge.
+        const host = makeDrawing();
+        const hx = makeVertex(host, 'x');
+        const hy = makeVertex(host, 'y');
+        const hz = makeVertex(host, 'z');
+        const ho = makeEdge(host, 'o', hx, hz);
+        const hu1 = makeEdge(host, 'u1', hx, hy);
+        const hu2 = makeEdge(host, 'u2', hx, hy);
+        const hv1 = makeEdge(host, 'v1', hy, hz);
+        const hv2 = makeEdge(host, 'v2', hy, hz);
+        host.newArtefact('Triangle', { '1': hu1, '2': hv1, o: ho }, {}, 'root');
+        host.newArtefact('Triangle', { '1': hu2, '2': hv2, o: ho }, {}, 'root');
+        host.newEqualityArtefact([hu1, hu2], 'root');
+        host.newEqualityArtefact([hv1, hv2], 'root');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = makeDrawing();
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        const rz = makeVertex(rule, 'z');
+        const re1 = makeEdge(rule, 'e1', rx, ry);
+        const re2 = makeEdge(rule, 'e2', ry, rz);
+        const rf = makeEdge(rule, 'f', rx, rz);
+        const rg = makeEdge(rule, 'g', rx, rz);
+        const rfo = rule.newArtefact('Triangle', { '1': re1, '2': re2, o: rf }, {}, 'root');
+        const rgo = rule.newArtefact('Triangle', { '1': re1, '2': re2, o: rg }, {}, 'root');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.newEqualityArtefact([rf, rg], 'conclusion');
+        rule.newEqualityArtefact([rfo, rgo], 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('SharedBase', rule);
+
+        const apps = findFirstOrderRuleApplications(rule, host, { injective: false, flexible: true });
+        // The cross match: the two Triangles land on the two different host
+        // Triangles, so the `fo = go` equality still makes progress, while
+        // `f` and `g` both land on the shared `o` edge.
+        const cross = apps.find(app => app.matchedArtefacts.get(rgo) !== app.matchedArtefacts.get(rfo));
+        expect(cross).toBeDefined();
+        expect(filterNoProgressRuleApplications(rule, host, [cross!]).length).toBe(1);
+
+        const result = applyFirstOrderRule(rule, host, cross!);
+        expect(result.created.has(rule.getArtefacts().find(a => a.sortName === "Equality" && a.dependencies['0'] === rf)!)).toBe(false);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        expect(() => recorder.recordRuleApply(rule, 'SharedBase', cross!, host, result, 'MainDrawing', sortStore)).not.toThrow();
+        const script = recorder.stop();
+
+        // Both conclusion elements are equalities, so both binders are masked
+        // and the collapsed one needs no name of its own.
+        expect(script).toMatch(/destruct_sigma \(@SharedBase_rule [^)]*\) as _ _\./);
+    });
+
+    it('exports a rule with a three-artefact root equality as separate equality binders', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'r3');
+        const ry = makeVertex(rule, 'r4');
+        const rz = makeVertex(rule, 'r2');
+        rule.newEqualityArtefact([rx, ry, rz], 'root');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'f', rx, rz, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('TriEqRoot', rule);
+
+        const code = exportDrawingsToRocq(store.getAllDrawings(), sortStore);
+        expect(code).toContain('Parameter TriEqRoot_rule : forall (r3 r4 r2 : Vertex)(eq_r3_r4_r2 : r3 = r4)(eq_r3_r4_r2_2 : r4 = r2),');
+        expect(code).not.toContain('r3 = r4 /\\');
+    });
+
+    it('records a rule application with a three-artefact root equality using two eq_refl witnesses', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ha = makeVertex(host, 'a');
+        const hb = makeVertex(host, 'b');
+        const hc = makeVertex(host, 'c');
+        host.newEqualityArtefact([ha, hb, hc], 'root');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        const rz = makeVertex(rule, 'z');
+        rule.newEqualityArtefact([rx, ry, rz], 'root');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'f', rx, rz, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('TriEqRoot', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findFirstOrderRuleApplications(rule, host, { flexible: true });
+        expect(apps.length).toBe(1);
+        const created = applyFirstOrderRule(rule, host, apps[0]);
+        recorder.recordRuleApply(rule, 'TriEqRoot', apps[0], host, created, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        expect(script).toContain('destruct_sigma (@TriEqRoot_rule a b c eq_refl eq_refl) as');
+    });
+
+    it('records an exact proof of a provable child layer, naming the matched parent', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ma = makeVertex(host, 'a');
+        const mb = makeVertex(host, 'b');
+        makeEdge(host, 'g', ma, mb);
+        host.addLayer('child', 'Child Layer', 'root');
+        makeEdge(host, 'c', ma, mb, 'child');
+        store.addDrawing('MainDrawing', host);
+
+        const result = host.checkLayerProvable('child');
+        expect(result.provable).toBe(true);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        recorder.recordProveSuccess(host, 'child', result.match ?? null, 'MainDrawing');
+        const script = recorder.stop();
+
+        expect(script).toContain('exact g.');
+    });
+
+    it('records an exact proof for a child layer containing an isMono established in the parent', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ma = makeVertex(host, 'a');
+        const mb = makeVertex(host, 'b');
+        const me = makeEdge(host, 'g', ma, mb);
+        
+        host.addLayer('child', 'Child Layer', 'root');
+        const ce = host.newArtefact('Edge', { source: ma, target: mb }, { width: 2, bend: 0, label: 'c' }, 'child');
+        host.addEqualityArtefactUnchecked([me, ce], 'child');
+
+        // isMono established in root AND child
+        host.newArtefact('isMono', { arrow: me }, {}, 'root');
+        host.newArtefact('isMono', { arrow: me }, {}, 'child');
+        
+        store.addDrawing('MainDrawing', host);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        
+        const result = host.checkLayerProvable('child');
+        expect(result.provable).toBe(true);
+        recorder.recordProveSuccess(host, 'child', result.match ?? null, 'MainDrawing');
+        
+        const script = recorder.stop();
+        // The proof witness should be a tuple with 'g' and the isMono proof term.
+        // It might be 'isMono_2' depending on NameRegistry specifics, so we check for exact (...).
+        expect(script).toContain('exact (');
+    });
+
+    it('records an exact proof when a child layer contains equations', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ma = makeVertex(host, 'a');
+        const mb = makeVertex(host, 'b');
+        makeEdge(host, 'g', ma, mb);
+        host.addEqualityArtefactUnchecked([ma, mb], 'root');
+
+        host.addLayer('child', 'Child Layer', 'root');
+        host.addEqualityArtefactUnchecked([ma, mb], 'child');
+        makeEdge(host, 'c', ma, mb, 'child');
+
+        store.addDrawing('MainDrawing', host);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+
+        const result = host.checkLayerProvable('child');
+        expect(result.provable).toBe(true);
+        recorder.recordProveSuccess(host, 'child', result.match ?? null, 'MainDrawing');
+
+        const script = recorder.stop();
+        expect(script).toContain('exact (');
+    });
+
+    it('preserves stable artefact ids across save/load (stable-id regression)', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ma = makeVertex(host, 'a');
+        const mb = makeVertex(host, 'b');
+        const g = makeEdge(host, 'g', ma, mb);
+        const eqRoot = host.addEqualityArtefactUnchecked([ma, mb], 'root');
+        host.addLayer('child', 'Child Layer', 'root');
+        const eqChild = host.addEqualityArtefactUnchecked([ma, mb], 'child');
+        const c = makeEdge(host, 'c', ma, mb, 'child');
+
+        const liveIds = [ma, mb, g, eqRoot, eqChild, c].map(a => a.id);
+        expect(new Set(liveIds).size).toBe(liveIds.length);
+
+        store.addDrawing('MainDrawing', host);
+
+        // Serialization must emit the live ids verbatim.
+        const serialized = store.exportDrawingsJSON(['MainDrawing']);
+        for (const id of liveIds) {
+            expect(serialized).toContain(`"id": "${id}"`);
+        }
+
+        // Loading into a fresh drawing must adopt those ids verbatim and keep
+        // getArtefactById resolving against them.
+        const reloaded = DrawingStore.hydrateDrawing(DrawingStore.drawingToSavedDrawing('MainDrawing', store.getDrawing('MainDrawing')!.drawing), sortStore);
+        const reloadedIds = reloaded.getArtefacts().map(a => a.id).sort();
+        expect(reloadedIds).toEqual([...liveIds].sort());
+        for (const id of liveIds) {
+            expect(reloaded.getArtefactById(id)).toBeDefined();
+        }
+        expect(reloaded.getArtefactById(c.id)).not.toBe(c);
+        expect(reloaded.getArtefactById(c.id)!.data.label).toBe('c');
+    });
+
+    it('records an edge duplication as set (new := old : Sort deps...)', () => {
+        const sortStore = newSortStore();
+        const host = new Drawing(sortStore);
+        const a = makeVertex(host, 'a');
+        const b = makeVertex(host, 'b');
+        const f = makeEdge(host, 'f', a, b);
+
+        const store = new DrawingStore();
+        store.addDrawing('MainDrawing', host);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+
+        const { artefact: f2 } = host.duplicateArtefact(f, { source: a, target: b }, { width: 2, bend: 0, label: 'f_copy' }, 'root');
+        recorder.recordDuplicate(host, f, f2, 'MainDrawing', sortStore);
+
+        const script = recorder.stop();
+        expect(script).toContain('set (f_copy := f : Edge a b).');
+    });
+
+    it('records a vertex duplication without dependencies as set (new := old : Vertex)', () => {
+        const sortStore = newSortStore();
+        const host = new Drawing(sortStore);
+        const a = makeVertex(host, 'a');
+
+        const store = new DrawingStore();
+        store.addDrawing('MainDrawing', host);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+
+        const { artefact: a2 } = host.duplicateArtefact(a, {}, { position: [100, 100], label: 'a_copy' }, 'root');
+        recorder.recordDuplicate(host, a, a2, 'MainDrawing', sortStore);
+
+        const script = recorder.stop();
+        expect(script).toContain('set (a_copy := a : Vertex).');
+    });
+
+    it('does not record duplication when recording is not active', () => {
+        const sortStore = newSortStore();
+        const host = new Drawing(sortStore);
+        const a = makeVertex(host, 'a');
+
+        const recorder = new RocqRecorder();
+        const { artefact: a2 } = host.duplicateArtefact(a, {}, { position: [100, 100], label: 'a_copy' }, 'root');
+        recorder.recordDuplicate(host, a, a2, 'MainDrawing', sortStore);
+
+        expect(recorder.isActive()).toBe(false);
+    });
+
+    it('inlines the real proof of a subgoal proven in the derived drawing', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        makeVertex(host, 'a');
+        makeVertex(host, 'b');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('premise-1', 'Premise', 'root');
+        makeEdge(rule, 'pe', rx, ry, 'premise-1');
+        rule.addLayer('premise-1-child', 'Premise Child', 'premise-1');
+        makeEdge(rule, 'pce', rx, ry, 'premise-1-child');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'ce', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('SecondOrderRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+
+        const apps = findSecondOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const result = applySecondOrderRule(rule, host, apps[0], { hostName: 'MainDrawing', ruleName: 'SecondOrderRule' });
+        const derived = result.derivedRules[0];
+        store.addDrawing(derived.name, derived.drawing);
+
+        const childLayer = getFirstOrderStatementChildLayer(derived.drawing);
+        expect(childLayer).not.toBeNull();
+        const prove = derived.drawing.checkLayerProvable(childLayer!.id);
+        expect(prove.provable).toBe(true);
+
+        recorder.recordRuleApply(
+            rule,
+            'SecondOrderRule',
+            apps[0],
+            host,
+            { artefacts: result.hostArtefacts, created: result.hostCreated, derivedNames: result.derivedRules.map(d => d.name), derived: result.derivedRules },
+            'MainDrawing',
+            sortStore
+        );
+        recorder.recordProveSuccess(derived.drawing, childLayer!.id, prove.match ?? null, derived.name);
+        const script = recorder.stop();
+
+        const subInlineIndex = script.indexOf('assert (Hpremise1 : forall (pe : Edge a b), Edge a b). {');
+        const mainLemmaIndex = script.indexOf('Lemma MainDrawing_rule :');
+        expect(subInlineIndex).toBeGreaterThan(-1);
+        expect(mainLemmaIndex).toBeGreaterThan(-1);
+        expect(subInlineIndex).toBeGreaterThan(mainLemmaIndex);
+        expect(script).not.toContain('Lemma MainDrawing___SecondOrderRule___Premise_rule :');
+        expect(script).not.toContain('Admitted.');
+        expect(script.slice(subInlineIndex)).toContain('exact pe.');
+        expect(script.slice(subInlineIndex)).toContain('\n}');
+        expect(script.slice(mainLemmaIndex)).toContain('Qed.');
+    });
+
+    it('inlines nested subgoal proofs inside the main lemma', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        makeVertex(host, 'a');
+        makeVertex(host, 'b');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('premise-1', 'Premise', 'root');
+        makeEdge(rule, 'pe', rx, ry, 'premise-1');
+        rule.addLayer('premise-1-child', 'Premise Child', 'premise-1');
+        makeEdge(rule, 'pce', rx, ry, 'premise-1-child');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'ce', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('SecondOrderRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+
+        const apps1 = findSecondOrderRuleApplications(rule, host);
+        expect(apps1.length).toBeGreaterThan(0);
+        const result1 = applySecondOrderRule(rule, host, apps1[0], { hostName: 'MainDrawing', ruleName: 'SecondOrderRule' });
+        const s1 = result1.derivedRules[0];
+        store.addDrawing(s1.name, s1.drawing);
+        recorder.recordRuleApply(
+            rule,
+            'SecondOrderRule',
+            apps1[0],
+            host,
+            { artefacts: result1.hostArtefacts, created: result1.hostCreated, derivedNames: result1.derivedRules.map(d => d.name) },
+            'MainDrawing',
+            sortStore
+        );
+
+        const apps2 = findSecondOrderRuleApplications(rule, s1.drawing);
+        expect(apps2.length).toBeGreaterThan(0);
+        const result2 = applySecondOrderRule(rule, s1.drawing, apps2[0], { hostName: s1.name, ruleName: 'SecondOrderRule' });
+        const s1sub = result2.derivedRules[0];
+        store.addDrawing(s1sub.name, s1sub.drawing);
+        recorder.recordRuleApply(
+            rule,
+            'SecondOrderRule',
+            apps2[0],
+            s1.drawing,
+            { artefacts: result2.hostArtefacts, created: result2.hostCreated, derivedNames: result2.derivedRules.map(d => d.name) },
+            s1.name,
+            sortStore
+        );
+
+        const script = recorder.stop();
+
+        // No standalone subgoal lemmas are emitted; both levels of subgoals are
+        // inlined as nested `assert ... . { ... }` blocks inside the main lemma.
+        expect(script).not.toContain('Lemma MainDrawing___SecondOrderRule___Premise___SecondOrderRule___Premise_rule :');
+        expect(script).not.toContain('Lemma MainDrawing___SecondOrderRule___Premise_rule :');
+        expect(script).toContain('Lemma MainDrawing_rule :');
+
+        // The same rule applied twice produces two inlined premise asserts (the
+        // inner one inside the outer one's braces).
+        const inlineAssertes = script.match(/assert \(Hpremise1 : forall \(pe : Edge a b\), Edge a b\)\. \{/g);
+        expect(inlineAssertes).not.toBeNull();
+        expect(inlineAssertes!.length).toBe(2);
+
+        // The first inline assert opens before the second one does, so the
+        // structure nests rather than flattening.
+        const first = script.indexOf('assert (Hpremise1 : forall (pe : Edge a b), Edge a b). {');
+        const second = script.indexOf('assert (Hpremise1 : forall (pe : Edge a b), Edge a b). {', first + 1);
+        expect(first).toBeGreaterThan(-1);
+        expect(second).toBeGreaterThan(first);
+    });
+
+    it('reverts a recorded proof to pending when a rule is applied after the proof was recorded', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        const ma = makeVertex(host, 'a');
+        const mb = makeVertex(host, 'b');
+        makeEdge(host, 'g', ma, mb);
+        host.addLayer('child', 'Child Layer', 'root');
+        makeEdge(host, 'c', ma, mb, 'child');
+        store.addDrawing('MainDrawing', host);
+
+        const result = host.checkLayerProvable('child');
+        expect(result.provable).toBe(true);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        recorder.recordProveSuccess(host, 'child', result.match ?? null, 'MainDrawing');
+        expect(recorder.getRecordedStatements().find(s => s.drawingName === 'MainDrawing')!.proved).toBe(true);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        rule.newArtefact('Edge', { source: rx, target: ry }, { width: 2, bend: 0, label: 'f' }, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('Foo', rule);
+        const apps = findFirstOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const created = applyFirstOrderRule(rule, host, apps[0]);
+        recorder.recordRuleApply(rule, 'Foo', apps[0], host, created, 'MainDrawing', sortStore);
+
+        expect(recorder.getRecordedStatements().find(s => s.drawingName === 'MainDrawing')!.proved).toBe(false);
+        const script = recorder.stop();
+        expect(script).toContain('Admitted.');
+        expect(script).not.toContain('Qed.');
+    });
+
+    it('exports an unfinished main with a conclusion goal as Admitted instead of Qed', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = buildIsMonoInChildLayerRule();
+        store.addDrawing('UnfinishedMonoHost', host);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'UnfinishedMonoHost', sortStore);
+        const script = recorder.stop();
+
+        expect(script).toContain('Lemma UnfinishedMonoHost_rule :');
+        expect(script).toContain('Admitted.');
+        expect(script).not.toContain('Qed.');
+        expect(script).not.toContain('exact');
+    });
+
+    it('closes a child-less main with exact I when no proof was recorded', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = buildComposableHost().host;
+        store.addDrawing('MainDrawing', host);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        expect(script).toContain('Lemma MainDrawing_rule :');
+        expect(script).toContain('exact I.');
+        expect(script).toContain('Qed.');
+        expect(script).not.toContain('Admitted.');
+    });
+
+    it('names premise binders consistently when a second-order rule has multiple premises with shared labels', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        makeVertex(host, 'a');
+        makeVertex(host, 'b');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('premise-1', 'Premise 1', 'root');
+        makeEdge(rule, 'pe', rx, ry, 'premise-1');
+        rule.addLayer('premise-1-child', 'Premise 1 Child', 'premise-1');
+        makeEdge(rule, 'pce', rx, ry, 'premise-1-child');
+        rule.addLayer('premise-2', 'Premise 2', 'root');
+        makeEdge(rule, 'pe', rx, ry, 'premise-2');
+        rule.addLayer('premise-2-child', 'Premise 2 Child', 'premise-2');
+        makeEdge(rule, 'pce', rx, ry, 'premise-2-child');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'ce', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        store.addDrawing('MultiPremiseRule', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+
+        const apps = findSecondOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const result = applySecondOrderRule(rule, host, apps[0], { hostName: 'MainDrawing', ruleName: 'MultiPremiseRule' });
+        expect(result.derivedRules.length).toBe(2);
+
+        const sub1 = result.derivedRules[0];
+        const sub2 = result.derivedRules[1];
+        store.addDrawing(sub1.name, sub1.drawing);
+        store.addDrawing(sub2.name, sub2.drawing);
+
+        const childLayer1 = getFirstOrderStatementChildLayer(sub1.drawing);
+        expect(childLayer1).not.toBeNull();
+        const prove1 = sub1.drawing.checkLayerProvable(childLayer1!.id);
+        expect(prove1.provable).toBe(true);
+
+        const childLayer2 = getFirstOrderStatementChildLayer(sub2.drawing);
+        expect(childLayer2).not.toBeNull();
+        const prove2 = sub2.drawing.checkLayerProvable(childLayer2!.id);
+        expect(prove2.provable).toBe(true);
+
+        recorder.recordRuleApply(
+            rule,
+            'MultiPremiseRule',
+            apps[0],
+            host,
+            { artefacts: result.hostArtefacts, created: result.hostCreated, derivedNames: result.derivedRules.map(d => d.name), derived: result.derivedRules },
+            'MainDrawing',
+            sortStore
+        );
+
+        recorder.recordProveSuccess(sub1.drawing, childLayer1!.id, prove1.match ?? null, sub1.name);
+        recorder.recordProveSuccess(sub2.drawing, childLayer2!.id, prove2.match ?? null, sub2.name);
+        recorder.recordProveSuccess(host, null, null, 'MainDrawing');
+
+        const script = recorder.stop();
+
+        // Both inlined premise asserts should use the derived drawing's local binder name 'pe',
+        // matching the inner 'exact pe.', rather than the rule-global 'pe_2'.
+        expect(script).toContain('assert (Hpremise1 : forall (pe : Edge a b), Edge a b). {');
+        expect(script).toContain('assert (Hpremise2 : forall (pe : Edge a b), Edge a b). {');
+        expect(script).not.toContain('Hpremise2 : forall (pe_2');
+
+        const firstAssert = script.indexOf('assert (Hpremise1 : forall (pe : Edge a b), Edge a b). {');
+        const firstExact = script.indexOf('exact pe.', firstAssert);
+        const secondAssert = script.indexOf('assert (Hpremise2 : forall (pe : Edge a b), Edge a b). {', firstExact);
+        const secondExact = script.indexOf('exact pe.', secondAssert);
+
+        expect(firstAssert).toBeGreaterThan(-1);
+        expect(firstExact).toBeGreaterThan(firstAssert);
+        expect(secondAssert).toBeGreaterThan(firstExact);
+        expect(secondExact).toBeGreaterThan(secondAssert);
+
+        expect(script).toContain('Qed.');
+        expect(script).not.toContain('Admitted.');
+    });
+
+    it('computes rule parameter base names consistently', () => {
+        expect(ruleParamBaseName('Triangle')).toBe('Triangle_rule');
+        expect(ruleParamBaseName('rule')).toBe('rule_rule');
+        expect(ruleParamBaseName('')).toBe('Drawing_rule');
+    });
+
+    it('invokes a second-order rule named after a reserved sort with matching rule parameter in destruct_sigma', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const host = new Drawing(sortStore);
+        makeVertex(host, 'a');
+        makeVertex(host, 'b');
+        store.addDrawing('MainDrawing', host);
+
+        const rule = new Drawing(sortStore);
+        const rx = makeVertex(rule, 'x');
+        const ry = makeVertex(rule, 'y');
+        rule.addLayer('premise-1', 'Premise', 'root');
+        makeEdge(rule, 'pe', rx, ry, 'premise-1');
+        rule.addLayer('premise-1-child', 'Premise Child', 'premise-1');
+        makeEdge(rule, 'pce', rx, ry, 'premise-1-child');
+        rule.addLayer('conclusion', 'Conclusion', 'root');
+        makeEdge(rule, 'ce', rx, ry, 'conclusion');
+        rule.setIsRule(true);
+        // "Triangle" is a defined sort, so previously drawingExportNames produced Triangle_2_rule
+        // whereas exportDrawingsToRocq produced Parameter Triangle_rule : ...
+        store.addDrawing('Triangle', rule);
+
+        const recorder = new RocqRecorder();
+        recorder.start(host, 'MainDrawing', sortStore);
+        const apps = findSecondOrderRuleApplications(rule, host);
+        expect(apps.length).toBeGreaterThan(0);
+        const result = applySecondOrderRule(rule, host, apps[0], { hostName: 'MainDrawing', ruleName: 'Triangle' });
+        recorder.recordRuleApply(rule, 'Triangle', apps[0], host, { artefacts: result.hostArtefacts, created: result.hostCreated, derived: result.derivedRules }, 'MainDrawing', sortStore);
+        const script = recorder.stop();
+
+        const code = exportDrawingsToRocq(store.getAllDrawings(), sortStore);
+        expect(code).toContain('Parameter Triangle_rule :');
+        expect(script).toContain('@Triangle_rule a b Hpremise1');
+        expect(script).toContain('destruct_sigma (@Triangle_rule a b Hpremise1) as ce.');
+        expect(script).not.toContain('@Triangle_2_rule');
+    });
+
+    it('exports a rule with an attached rocq proof as the proof instead of a Parameter', () => {
+        const sortStore = newSortStore();
+        const store = new DrawingStore();
+
+        const stmt = new Drawing(sortStore);
+        const a = makeVertex(stmt, 'a');
+        const b = makeVertex(stmt, 'b');
+        makeEdge(stmt, 'g', a, b);
+        stmt.addLayer('conc', 'Conclusion', 'root');
+        makeEdge(stmt, 'c', a, b, 'conc');
+        stmt.setIsRule(true);
+        store.addDrawing('Stmt', stmt);
+
+        const plain = new Drawing(sortStore);
+        const px = makeVertex(plain, 'x');
+        const py = makeVertex(plain, 'y');
+        plain.addLayer('conc', 'Conclusion', 'root');
+        plain.newArtefact('Edge', { source: px, target: py }, { width: 2, bend: 0, label: 'f' }, 'conc');
+        plain.setIsRule(true);
+        store.addDrawing('Plain', plain);
+
+        const recorder = new RocqRecorder();
+        recorder.start(stmt, 'Stmt', sortStore);
+        const check = stmt.checkLayerProvable('conc');
+        expect(check.provable).toBe(true);
+        recorder.recordProveSuccess(stmt, 'conc', check.match ?? null, 'Stmt');
+        const script = recorder.stop();
+
+        expect(script).toContain('Lemma Stmt_rule :');
+        expect(script).toContain('Qed.');
+        stmt.setRocqProof(script);
+
+        const code = exportDrawingsToRocq(store.getAllDrawings(), sortStore);
+        expect(code).toContain('Lemma Stmt_rule :');
+        expect(code).toContain('Qed.');
+        expect(code).not.toContain('Parameter Stmt_rule :');
+        expect(code).toContain('Parameter Plain_rule :');
+    });
+});
